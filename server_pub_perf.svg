@@ -1,0 +1,1980 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="438" onload="init(evt)" viewBox="0 0 1200 438" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+
+		// use GET parameters to restore a flamegraphs state.
+		var params = get_params();
+		if (params.x && params.y)
+			zoom(find_group(document.querySelector('[x="' + params.x + '"][y="' + params.y + '"]')));
+                if (params.s) search(params.s);
+	}
+
+	// event listeners
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom();
+			zoom(target);
+			if (!document.querySelector('.parent')) {
+				clearzoom();
+				return;
+			}
+
+			// set parameters for zoom state
+			var el = target.querySelector("rect");
+			if (el && el.attributes && el.attributes.y && el.attributes._orig_x) {
+				var params = get_params()
+				params.x = el.attributes._orig_x.value;
+				params.y = el.attributes.y.value;
+				history.replaceState(null, null, parse_params(params));
+			}
+		}
+		else if (e.target.id == "unzoom") clearzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+		else if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function get_params() {
+		var params = {};
+		var paramsarr = window.location.search.substr(1).split('&');
+		for (var i = 0; i < paramsarr.length; ++i) {
+			var tmp = paramsarr[i].split("=");
+			if (!tmp[0] || !tmp[1]) continue;
+			params[tmp[0]]  = decodeURIComponent(tmp[1]);
+		}
+		return params;
+	}
+	function parse_params(params) {
+		var uri = "?";
+		for (var key in params) {
+			uri += key + '=' + encodeURIComponent(params[key]) + '&';
+		}
+		if (uri.slice(-1) == "&")
+			uri = uri.substring(0, uri.length - 1);
+		if (uri == '?')
+			uri = window.location.href.split('?')[0];
+		return uri;
+	}
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		// Fit in full text width
+		if (/^ *$/.test(txt) || t.getSubStringLength(0, txt.length) < w)
+			return;
+
+		for (var x = txt.length - 2; x > 0; x--) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom() {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			update_text(el[i]);
+		}
+		search();
+	}
+	function clearzoom() {
+		unzoom();
+
+		// remove zoom state
+		var params = get_params();
+		if (params.x) delete params.x;
+		if (params.y) delete params.y;
+		history.replaceState(null, null, parse_params(params));
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+		var params = get_params();
+		delete params.s;
+		history.replaceState(null, null, parse_params(params));
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) search(term);
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (term) currentSearchTerm = term;
+
+		var re = new RegExp(currentSearchTerm, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+		var params = get_params();
+		params.s = currentSearchTerm;
+		history.replaceState(null, null, parse_params(params));
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="438.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >Flame Graph</text>
+<text id="details" x="10.00" y="421" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="421" > </text>
+<g id="frames">
+<g >
+<title>std::_Rb_tree&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt; &gt;, std::_Select1st&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt; &gt; &gt;, std::less&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt; &gt; &gt; &gt;::_M_lower_bound (1 samples, 0.23%)</title><rect x="64.8" y="149" width="2.7" height="15.0" fill="rgb(233,81,38)" rx="2" ry="2" />
+<text  x="67.76" y="159.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (36 samples, 8.35%)</title><rect x="100.3" y="325" width="98.6" height="15.0" fill="rgb(212,212,30)" rx="2" ry="2" />
+<text  x="103.35" y="335.5" >entry_SYSCA..</text>
+</g>
+<g >
+<title>sched_clock_cpu (1 samples, 0.23%)</title><rect x="426.1" y="149" width="2.8" height="15.0" fill="rgb(244,160,43)" rx="2" ry="2" />
+<text  x="429.15" y="159.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (35 samples, 8.12%)</title><rect x="212.6" y="213" width="95.8" height="15.0" fill="rgb(249,168,35)" rx="2" ry="2" />
+<text  x="215.60" y="223.5" >finish_task..</text>
+</g>
+<g >
+<title>switch_fpu_return (1 samples, 0.23%)</title><rect x="308.4" y="293" width="2.8" height="15.0" fill="rgb(213,124,11)" rx="2" ry="2" />
+<text  x="311.42" y="303.5" ></text>
+</g>
+<g >
+<title>apic_timer_interrupt (2 samples, 0.46%)</title><rect x="1146.2" y="197" width="5.5" height="15.0" fill="rgb(237,181,33)" rx="2" ry="2" />
+<text  x="1149.19" y="207.5" ></text>
+</g>
+<g >
+<title>[[vdso]] (1 samples, 0.23%)</title><rect x="1187.3" y="309" width="2.7" height="15.0" fill="rgb(227,27,44)" rx="2" ry="2" />
+<text  x="1190.26" y="319.5" ></text>
+</g>
+<g >
+<title>intel_tfa_pmu_enable_all (20 samples, 4.64%)</title><rect x="349.5" y="117" width="54.7" height="15.0" fill="rgb(250,4,11)" rx="2" ry="2" />
+<text  x="352.49" y="127.5" >intel..</text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (1 samples, 0.23%)</title><rect x="313.9" y="181" width="2.7" height="15.0" fill="rgb(227,227,10)" rx="2" ry="2" />
+<text  x="316.90" y="191.5" ></text>
+</g>
+<g >
+<title>std::chrono::operator&lt; &lt;std::chrono::_V2::system_clock, std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000000l&gt; &gt;, std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000000l&gt; &gt; &gt; (1 samples, 0.23%)</title><rect x="51.1" y="181" width="2.7" height="15.0" fill="rgb(233,205,39)" rx="2" ry="2" />
+<text  x="54.07" y="191.5" ></text>
+</g>
+<g >
+<title>drive::common::metrics::ScopedTimer::~ScopedTimer (1 samples, 0.23%)</title><rect x="10.0" y="133" width="2.7" height="15.0" fill="rgb(247,163,52)" rx="2" ry="2" />
+<text  x="13.00" y="143.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (35 samples, 8.12%)</title><rect x="212.6" y="229" width="95.8" height="15.0" fill="rgb(242,188,23)" rx="2" ry="2" />
+<text  x="215.60" y="239.5" >__sched_tex..</text>
+</g>
+<g >
+<title>schedule_hrtimeout_range (22 samples, 5.10%)</title><rect x="344.0" y="245" width="60.2" height="15.0" fill="rgb(206,118,43)" rx="2" ry="2" />
+<text  x="347.01" y="255.5" >schedu..</text>
+</g>
+<g >
+<title>psi_task_change (1 samples, 0.23%)</title><rect x="426.1" y="181" width="2.8" height="15.0" fill="rgb(240,12,1)" rx="2" ry="2" />
+<text  x="429.15" y="191.5" ></text>
+</g>
+<g >
+<title>perf_pmu_disable.part.0 (1 samples, 0.23%)</title><rect x="606.8" y="181" width="2.8" height="15.0" fill="rgb(248,219,48)" rx="2" ry="2" />
+<text  x="609.84" y="191.5" ></text>
+</g>
+<g >
+<title>std::thread::_Invoker&lt;std::tuple&lt;void  (17 samples, 3.94%)</title><rect x="53.8" y="309" width="46.5" height="15.0" fill="rgb(239,115,37)" rx="2" ry="2" />
+<text  x="56.81" y="319.5" >std:..</text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (232 samples, 53.83%)</title><rect x="532.9" y="341" width="635.2" height="15.0" fill="rgb(251,200,9)" rx="2" ry="2" />
+<text  x="535.92" y="351.5" >entry_SYSCALL_64_after_hwframe</text>
+</g>
+<g >
+<title>account_system_time (1 samples, 0.23%)</title><rect x="1148.9" y="69" width="2.8" height="15.0" fill="rgb(217,112,3)" rx="2" ry="2" />
+<text  x="1151.93" y="79.5" ></text>
+</g>
+<g >
+<title>LockFreeAppendOnlyHashMap&lt;drive::common::metrics::LogTimer, 65536ul&gt;::find_or_insert&lt;LockFreeAppendOnlyHashMap&lt;drive::common::metrics::LogTimer, 65536ul&gt;::insert&lt;boost::basic_string_view&lt;char, std::char_traits&lt;char&gt; &gt;&amp;, boost::basic_string_view&lt;char, std::char_traits&lt;char&gt; &gt;&amp;&gt; (1 samples, 0.23%)</title><rect x="29.2" y="197" width="2.7" height="15.0" fill="rgb(220,129,38)" rx="2" ry="2" />
+<text  x="32.16" y="207.5" ></text>
+</g>
+<g >
+<title>syscall_return_via_sysret (1 samples, 0.23%)</title><rect x="311.2" y="325" width="2.7" height="15.0" fill="rgb(243,77,37)" rx="2" ry="2" />
+<text  x="314.16" y="335.5" ></text>
+</g>
+<g >
+<title>__hrtimer_run_queues (1 samples, 0.23%)</title><rect x="103.1" y="213" width="2.7" height="15.0" fill="rgb(251,181,5)" rx="2" ry="2" />
+<text  x="106.09" y="223.5" ></text>
+</g>
+<g >
+<title>__GI___mq_timedreceive (36 samples, 8.35%)</title><rect x="100.3" y="341" width="98.6" height="15.0" fill="rgb(250,65,16)" rx="2" ry="2" />
+<text  x="103.35" y="351.5" >__GI___mq_t..</text>
+</g>
+<g >
+<title>std::unique_ptr&lt;drive::common::ipc::GlobalShmBusImpl, std::default_delete&lt;drive::common::ipc::GlobalShmBusImpl&gt; &gt;::get (1 samples, 0.23%)</title><rect x="26.4" y="197" width="2.8" height="15.0" fill="rgb(215,168,4)" rx="2" ry="2" />
+<text  x="29.43" y="207.5" ></text>
+</g>
+<g >
+<title>__dynamic_cast (1 samples, 0.23%)</title><rect x="75.7" y="213" width="2.7" height="15.0" fill="rgb(205,8,25)" rx="2" ry="2" />
+<text  x="78.71" y="223.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (22 samples, 5.10%)</title><rect x="344.0" y="165" width="60.2" height="15.0" fill="rgb(222,140,38)" rx="2" ry="2" />
+<text  x="347.01" y="175.5" >__perf..</text>
+</g>
+<g >
+<title>update_nohz_stats (1 samples, 0.23%)</title><rect x="1157.1" y="165" width="2.8" height="15.0" fill="rgb(215,25,20)" rx="2" ry="2" />
+<text  x="1160.15" y="175.5" ></text>
+</g>
+<g >
+<title>enqueue_entity (1 samples, 0.23%)</title><rect x="103.1" y="101" width="2.7" height="15.0" fill="rgb(243,215,22)" rx="2" ry="2" />
+<text  x="106.09" y="111.5" ></text>
+</g>
+<g >
+<title>futex_wait (1 samples, 0.23%)</title><rect x="319.4" y="261" width="2.7" height="15.0" fill="rgb(238,186,46)" rx="2" ry="2" />
+<text  x="322.37" y="271.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (1 samples, 0.23%)</title><rect x="94.9" y="197" width="2.7" height="15.0" fill="rgb(240,26,47)" rx="2" ry="2" />
+<text  x="97.87" y="207.5" ></text>
+</g>
+<g >
+<title>ctx_sched_in (3 samples, 0.70%)</title><rect x="428.9" y="149" width="8.2" height="15.0" fill="rgb(219,29,15)" rx="2" ry="2" />
+<text  x="431.89" y="159.5" ></text>
+</g>
+<g >
+<title>__tls_get_addr (2 samples, 0.46%)</title><rect x="12.7" y="213" width="5.5" height="15.0" fill="rgb(238,154,51)" rx="2" ry="2" />
+<text  x="15.74" y="223.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (1 samples, 0.23%)</title><rect x="409.7" y="309" width="2.8" height="15.0" fill="rgb(206,37,6)" rx="2" ry="2" />
+<text  x="412.72" y="319.5" ></text>
+</g>
+<g >
+<title>__vdso_gettimeofday (1 samples, 0.23%)</title><rect x="1187.3" y="325" width="2.7" height="15.0" fill="rgb(217,7,26)" rx="2" ry="2" />
+<text  x="1190.26" y="335.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (2 samples, 0.46%)</title><rect x="313.9" y="325" width="5.5" height="15.0" fill="rgb(253,53,35)" rx="2" ry="2" />
+<text  x="316.90" y="335.5" ></text>
+</g>
+<g >
+<title>malloc (1 samples, 0.23%)</title><rect x="407.0" y="341" width="2.7" height="15.0" fill="rgb(222,8,52)" rx="2" ry="2" />
+<text  x="409.98" y="351.5" ></text>
+</g>
+<g >
+<title>std::atomic&lt;drive::common::base::HighResTimerState&gt;::compare_exchange_strong (1 samples, 0.23%)</title><rect x="18.2" y="181" width="2.8" height="15.0" fill="rgb(216,220,42)" rx="2" ry="2" />
+<text  x="21.21" y="191.5" ></text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.70%)</title><rect x="324.8" y="309" width="8.3" height="15.0" fill="rgb(216,202,26)" rx="2" ry="2" />
+<text  x="327.85" y="319.5" ></text>
+</g>
+<g >
+<title>std::_Rb_tree&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt; &gt;, std::_Select1st&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt; &gt; &gt;, std::less&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt; &gt; &gt; &gt;::_M_begin (1 samples, 0.23%)</title><rect x="21.0" y="149" width="2.7" height="15.0" fill="rgb(237,204,19)" rx="2" ry="2" />
+<text  x="23.95" y="159.5" ></text>
+</g>
+<g >
+<title>__pthread_mutex_lock (1 samples, 0.23%)</title><rect x="415.2" y="325" width="2.7" height="15.0" fill="rgb(252,78,51)" rx="2" ry="2" />
+<text  x="418.20" y="335.5" ></text>
+</g>
+<g >
+<title>perf_swevent_add (1 samples, 0.23%)</title><rect x="346.8" y="53" width="2.7" height="15.0" fill="rgb(205,86,44)" rx="2" ry="2" />
+<text  x="349.75" y="63.5" ></text>
+</g>
+<g >
+<title>futex_wake (1 samples, 0.23%)</title><rect x="94.9" y="149" width="2.7" height="15.0" fill="rgb(235,86,19)" rx="2" ry="2" />
+<text  x="97.87" y="159.5" ></text>
+</g>
+<g >
+<title>futex_wait_queue_me (217 samples, 50.35%)</title><rect x="565.8" y="261" width="594.1" height="15.0" fill="rgb(231,177,2)" rx="2" ry="2" />
+<text  x="568.78" y="271.5" >futex_wait_queue_me</text>
+</g>
+<g >
+<title>__x64_sys_mq_timedreceive (36 samples, 8.35%)</title><rect x="100.3" y="293" width="98.6" height="15.0" fill="rgb(217,214,27)" rx="2" ry="2" />
+<text  x="103.35" y="303.5" >__x64_sys_m..</text>
+</g>
+<g >
+<title>get_timespec64 (1 samples, 0.23%)</title><rect x="1165.4" y="293" width="2.7" height="15.0" fill="rgb(220,207,26)" rx="2" ry="2" />
+<text  x="1168.36" y="303.5" ></text>
+</g>
+<g >
+<title>drive::common::base::HighResTimer::stop (1 samples, 0.23%)</title><rect x="18.2" y="197" width="2.8" height="15.0" fill="rgb(249,146,54)" rx="2" ry="2" />
+<text  x="21.21" y="207.5" ></text>
+</g>
+<g >
+<title>hrtimer_cancel (1 samples, 0.23%)</title><rect x="1162.6" y="261" width="2.8" height="15.0" fill="rgb(224,198,54)" rx="2" ry="2" />
+<text  x="1165.62" y="271.5" ></text>
+</g>
+<g >
+<title>__update_load_avg_se (1 samples, 0.23%)</title><rect x="1157.1" y="117" width="2.8" height="15.0" fill="rgb(209,87,38)" rx="2" ry="2" />
+<text  x="1160.15" y="127.5" ></text>
+</g>
+<g >
+<title>std::chrono::duration_cast&lt;std::chrono::duration&lt;long, std::ratio&lt;1l, 1l&gt; &gt;, long, std::ratio&lt;1l, 1000l&gt; &gt; (1 samples, 0.23%)</title><rect x="201.6" y="213" width="2.8" height="15.0" fill="rgb(248,217,24)" rx="2" ry="2" />
+<text  x="204.65" y="223.5" ></text>
+</g>
+<g >
+<title>perf_event_sched_in (3 samples, 0.70%)</title><rect x="428.9" y="165" width="8.2" height="15.0" fill="rgb(229,147,30)" rx="2" ry="2" />
+<text  x="431.89" y="175.5" ></text>
+</g>
+<g >
+<title>schedule (1 samples, 0.23%)</title><rect x="319.4" y="229" width="2.7" height="15.0" fill="rgb(249,119,24)" rx="2" ry="2" />
+<text  x="322.37" y="239.5" ></text>
+</g>
+<g >
+<title>syscall_return_via_sysret (7 samples, 1.62%)</title><rect x="1168.1" y="341" width="19.2" height="15.0" fill="rgb(226,23,7)" rx="2" ry="2" />
+<text  x="1171.10" y="351.5" ></text>
+</g>
+<g >
+<title>x86_pmu_enable (33 samples, 7.66%)</title><rect x="218.1" y="165" width="90.3" height="15.0" fill="rgb(208,229,33)" rx="2" ry="2" />
+<text  x="221.07" y="175.5" >x86_pmu_en..</text>
+</g>
+<g >
+<title>visit_groups_merge (2 samples, 0.46%)</title><rect x="431.6" y="133" width="5.5" height="15.0" fill="rgb(207,91,26)" rx="2" ry="2" />
+<text  x="434.62" y="143.5" ></text>
+</g>
+<g >
+<title>std::__shared_ptr&lt;std::mutex,  (1 samples, 0.23%)</title><rect x="48.3" y="197" width="2.8" height="15.0" fill="rgb(233,153,2)" rx="2" ry="2" />
+<text  x="51.33" y="207.5" ></text>
+</g>
+<g >
+<title>psi_task_change (1 samples, 0.23%)</title><rect x="579.5" y="197" width="2.7" height="15.0" fill="rgb(251,74,11)" rx="2" ry="2" />
+<text  x="582.47" y="207.5" ></text>
+</g>
+<g >
+<title>hrtimer_interrupt (1 samples, 0.23%)</title><rect x="103.1" y="229" width="2.7" height="15.0" fill="rgb(209,5,46)" rx="2" ry="2" />
+<text  x="106.09" y="239.5" ></text>
+</g>
+<g >
+<title>newidle_balance (1 samples, 0.23%)</title><rect x="1157.1" y="197" width="2.8" height="15.0" fill="rgb(250,179,40)" rx="2" ry="2" />
+<text  x="1160.15" y="207.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (25 samples, 5.80%)</title><rect x="335.8" y="309" width="68.4" height="15.0" fill="rgb(238,75,22)" rx="2" ry="2" />
+<text  x="338.80" y="319.5" >do_sysc..</text>
+</g>
+<g >
+<title>std::condition_variable::wait_for&lt;long, std::ratio&lt;1l, 1000000l&gt;, drive::common::periodics::Scheduler::WorkerPool::runCallbacksUntilDead (2 samples, 0.46%)</title><rect x="83.9" y="245" width="5.5" height="15.0" fill="rgb(212,113,14)" rx="2" ry="2" />
+<text  x="86.92" y="255.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (27 samples, 6.26%)</title><rect x="428.9" y="181" width="73.9" height="15.0" fill="rgb(249,144,33)" rx="2" ry="2" />
+<text  x="431.89" y="191.5" >__perf_e..</text>
+</g>
+<g >
+<title>perf_swevent_add (2 samples, 0.46%)</title><rect x="598.6" y="85" width="5.5" height="15.0" fill="rgb(220,66,17)" rx="2" ry="2" />
+<text  x="601.63" y="95.5" ></text>
+</g>
+<g >
+<title>do_sys_poll (31 samples, 7.19%)</title><rect x="420.7" y="293" width="84.8" height="15.0" fill="rgb(253,79,27)" rx="2" ry="2" />
+<text  x="423.67" y="303.5" >do_sys_poll</text>
+</g>
+<g >
+<title>native_write_msr (32 samples, 7.42%)</title><rect x="111.3" y="117" width="87.6" height="15.0" fill="rgb(240,63,16)" rx="2" ry="2" />
+<text  x="114.30" y="127.5" >native_wri..</text>
+</g>
+<g >
+<title>drive::common::ipc::LocalShmBus::processOwnBusListener (2 samples, 0.46%)</title><rect x="12.7" y="229" width="5.5" height="15.0" fill="rgb(253,43,54)" rx="2" ry="2" />
+<text  x="15.74" y="239.5" ></text>
+</g>
+<g >
+<title>LockFreeAppendOnlyHashMap&lt;drive::common::metrics::LogTimer, 65536ul&gt;::insert&lt;boost::basic_string_view&lt;char, std::char_traits&lt;char&gt; &gt;&amp;, boost::basic_string_view&lt;char, std::char_traits&lt;char&gt; &gt;&amp;&gt; (1 samples, 0.23%)</title><rect x="62.0" y="229" width="2.8" height="15.0" fill="rgb(222,23,49)" rx="2" ry="2" />
+<text  x="65.02" y="239.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (1 samples, 0.23%)</title><rect x="409.7" y="325" width="2.8" height="15.0" fill="rgb(248,195,22)" rx="2" ry="2" />
+<text  x="412.72" y="335.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (34 samples, 7.89%)</title><rect x="105.8" y="197" width="93.1" height="15.0" fill="rgb(225,149,2)" rx="2" ry="2" />
+<text  x="108.82" y="207.5" >finish_task..</text>
+</g>
+<g >
+<title>__x64_sys_read (1 samples, 0.23%)</title><rect x="409.7" y="293" width="2.8" height="15.0" fill="rgb(220,175,19)" rx="2" ry="2" />
+<text  x="412.72" y="303.5" ></text>
+</g>
+<g >
+<title>ctx_sched_in (1 samples, 0.23%)</title><rect x="108.6" y="149" width="2.7" height="15.0" fill="rgb(207,99,6)" rx="2" ry="2" />
+<text  x="111.56" y="159.5" ></text>
+</g>
+<g >
+<title>drive::common::metrics::LogTimer::update (2 samples, 0.46%)</title><rect x="21.0" y="197" width="5.4" height="15.0" fill="rgb(250,123,18)" rx="2" ry="2" />
+<text  x="23.95" y="207.5" ></text>
+</g>
+<g >
+<title>std::__cmpexch_failure_order2 (1 samples, 0.23%)</title><rect x="53.8" y="181" width="2.7" height="15.0" fill="rgb(243,18,47)" rx="2" ry="2" />
+<text  x="56.81" y="191.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (217 samples, 50.35%)</title><rect x="565.8" y="229" width="594.1" height="15.0" fill="rgb(245,187,7)" rx="2" ry="2" />
+<text  x="568.78" y="239.5" >__sched_text_start</text>
+</g>
+<g >
+<title>flexible_sched_in (4 samples, 0.93%)</title><rect x="595.9" y="133" width="10.9" height="15.0" fill="rgb(216,103,35)" rx="2" ry="2" />
+<text  x="598.89" y="143.5" ></text>
+</g>
+<g >
+<title>visit_groups_merge (1 samples, 0.23%)</title><rect x="346.8" y="117" width="2.7" height="15.0" fill="rgb(220,94,17)" rx="2" ry="2" />
+<text  x="349.75" y="127.5" ></text>
+</g>
+<g >
+<title>futex_wait_queue_me (1 samples, 0.23%)</title><rect x="319.4" y="245" width="2.7" height="15.0" fill="rgb(235,92,23)" rx="2" ry="2" />
+<text  x="322.37" y="255.5" ></text>
+</g>
+<g >
+<title>seq_put_decimal_ull (1 samples, 0.23%)</title><rect x="409.7" y="165" width="2.8" height="15.0" fill="rgb(224,181,31)" rx="2" ry="2" />
+<text  x="412.72" y="175.5" ></text>
+</g>
+<g >
+<title>std::condition_variable::__wait_until_impl&lt;std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000000l&gt; &gt; &gt; (1 samples, 0.23%)</title><rect x="86.7" y="197" width="2.7" height="15.0" fill="rgb(209,197,49)" rx="2" ry="2" />
+<text  x="89.66" y="207.5" ></text>
+</g>
+<g >
+<title>LockFreeAppendOnlyHashMap&lt;drive::common::metrics::LogTimer, 65536ul&gt;::find_or_insert&lt;LockFreeAppendOnlyHashMap&lt;drive::common::metrics::LogTimer, 65536ul&gt;::insert&lt;boost::basic_string_view&lt;char, std::char_traits&lt;char&gt; &gt;&amp;, boost::basic_string_view&lt;char, std::char_traits&lt;char&gt; &gt;&amp;&gt; (1 samples, 0.23%)</title><rect x="62.0" y="213" width="2.8" height="15.0" fill="rgb(252,21,40)" rx="2" ry="2" />
+<text  x="65.02" y="223.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (205 samples, 47.56%)</title><rect x="584.9" y="197" width="561.3" height="15.0" fill="rgb(233,143,51)" rx="2" ry="2" />
+<text  x="587.94" y="207.5" >__perf_event_task_sched_in</text>
+</g>
+<g >
+<title>__vfs_read (1 samples, 0.23%)</title><rect x="409.7" y="245" width="2.8" height="15.0" fill="rgb(238,135,52)" rx="2" ry="2" />
+<text  x="412.72" y="255.5" ></text>
+</g>
+<g >
+<title>perf_event_sched_in (1 samples, 0.23%)</title><rect x="212.6" y="181" width="2.7" height="15.0" fill="rgb(229,167,35)" rx="2" ry="2" />
+<text  x="215.60" y="191.5" ></text>
+</g>
+<g >
+<title>dequeue_task_fair (1 samples, 0.23%)</title><rect x="319.4" y="181" width="2.7" height="15.0" fill="rgb(250,194,8)" rx="2" ry="2" />
+<text  x="322.37" y="191.5" ></text>
+</g>
+<g >
+<title>update_process_times (1 samples, 0.23%)</title><rect x="1148.9" y="101" width="2.8" height="15.0" fill="rgb(236,221,45)" rx="2" ry="2" />
+<text  x="1151.93" y="111.5" ></text>
+</g>
+<g >
+<title>intel_tfa_pmu_enable_all (24 samples, 5.57%)</title><rect x="437.1" y="133" width="65.7" height="15.0" fill="rgb(245,57,29)" rx="2" ry="2" />
+<text  x="440.10" y="143.5" >intel_t..</text>
+</g>
+<g >
+<title>[libstdc++.so.6.0.25] (33 samples, 7.66%)</title><rect x="10.0" y="357" width="90.3" height="15.0" fill="rgb(216,30,28)" rx="2" ry="2" />
+<text  x="13.00" y="367.5" >[libstdc++..</text>
+</g>
+<g >
+<title>ctx_sched_out (1 samples, 0.23%)</title><rect x="571.3" y="181" width="2.7" height="15.0" fill="rgb(248,94,4)" rx="2" ry="2" />
+<text  x="574.25" y="191.5" ></text>
+</g>
+<g >
+<title>std::thread::_State_impl&lt;std::thread::_Invoker&lt;std::tuple&lt;IpcBenchmarkProgram::go (1 samples, 0.23%)</title><rect x="10.0" y="341" width="2.7" height="15.0" fill="rgb(245,197,25)" rx="2" ry="2" />
+<text  x="13.00" y="351.5" ></text>
+</g>
+<g >
+<title>group_sched_in (4 samples, 0.93%)</title><rect x="595.9" y="117" width="10.9" height="15.0" fill="rgb(228,151,0)" rx="2" ry="2" />
+<text  x="598.89" y="127.5" ></text>
+</g>
+<g >
+<title>account_entity_enqueue (1 samples, 0.23%)</title><rect x="103.1" y="85" width="2.7" height="15.0" fill="rgb(236,12,14)" rx="2" ry="2" />
+<text  x="106.09" y="95.5" ></text>
+</g>
+<g >
+<title>ros::PollManager::threadFunc (1 samples, 0.23%)</title><rect x="415.2" y="341" width="2.7" height="15.0" fill="rgb(250,12,27)" rx="2" ry="2" />
+<text  x="418.20" y="351.5" ></text>
+</g>
+<g >
+<title>do_epoll_wait (23 samples, 5.34%)</title><rect x="341.3" y="277" width="62.9" height="15.0" fill="rgb(251,215,0)" rx="2" ry="2" />
+<text  x="344.28" y="287.5" >do_epo..</text>
+</g>
+<g >
+<title>drive::common::base::ROSProgram::run (3 samples, 0.70%)</title><rect x="198.9" y="309" width="8.2" height="15.0" fill="rgb(226,156,2)" rx="2" ry="2" />
+<text  x="201.91" y="319.5" ></text>
+</g>
+<g >
+<title>__hrtimer_run_queues (2 samples, 0.46%)</title><rect x="1146.2" y="149" width="5.5" height="15.0" fill="rgb(229,145,43)" rx="2" ry="2" />
+<text  x="1149.19" y="159.5" ></text>
+</g>
+<g >
+<title>std::condition_variable::wait_until&lt;std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000000l&gt; &gt; &gt; (2 samples, 0.46%)</title><rect x="83.9" y="213" width="5.5" height="15.0" fill="rgb(213,185,10)" rx="2" ry="2" />
+<text  x="86.92" y="223.5" ></text>
+</g>
+<g >
+<title>drive::common::metrics::ScopedTimer::ScopedTimer (1 samples, 0.23%)</title><rect x="73.0" y="229" width="2.7" height="15.0" fill="rgb(243,3,4)" rx="2" ry="2" />
+<text  x="75.97" y="239.5" ></text>
+</g>
+<g >
+<title>LockFreeAppendOnlyHashMap&lt;drive::common::metrics::LogTimer, 65536ul&gt;::GetKeyHash (1 samples, 0.23%)</title><rect x="29.2" y="181" width="2.7" height="15.0" fill="rgb(242,82,28)" rx="2" ry="2" />
+<text  x="32.16" y="191.5" ></text>
+</g>
+<g >
+<title>drive::common::metrics::ScopedTimer::stop (2 samples, 0.46%)</title><rect x="31.9" y="229" width="5.5" height="15.0" fill="rgb(243,60,8)" rx="2" ry="2" />
+<text  x="34.90" y="239.5" ></text>
+</g>
+<g >
+<title>std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000000l&gt; &gt;::count (1 samples, 0.23%)</title><rect x="51.1" y="165" width="2.7" height="15.0" fill="rgb(205,105,0)" rx="2" ry="2" />
+<text  x="54.07" y="175.5" ></text>
+</g>
+<g >
+<title>drive::common::ipc::spin (3 samples, 0.70%)</title><rect x="198.9" y="261" width="8.2" height="15.0" fill="rgb(213,42,18)" rx="2" ry="2" />
+<text  x="201.91" y="271.5" ></text>
+</g>
+<g >
+<title>drive::common::metrics::ScopedTimer::stop (1 samples, 0.23%)</title><rect x="64.8" y="229" width="2.7" height="15.0" fill="rgb(208,62,13)" rx="2" ry="2" />
+<text  x="67.76" y="239.5" ></text>
+</g>
+<g >
+<title>std::get&lt;0ul, LockFreeAppendOnlyHashMap&lt;drive::common::metrics::LogTimer, 65536ul&gt;::Entry*, std::default_delete&lt;LockFreeAppendOnlyHashMap&lt;drive::common::metrics::LogTimer, 65536ul&gt;::Entry&gt; &gt; (1 samples, 0.23%)</title><rect x="62.0" y="165" width="2.8" height="15.0" fill="rgb(253,168,28)" rx="2" ry="2" />
+<text  x="65.02" y="175.5" ></text>
+</g>
+<g >
+<title>__poll (33 samples, 7.66%)</title><rect x="417.9" y="357" width="90.4" height="15.0" fill="rgb(231,113,13)" rx="2" ry="2" />
+<text  x="420.94" y="367.5" >__poll</text>
+</g>
+<g >
+<title>update_load_avg (1 samples, 0.23%)</title><rect x="1157.1" y="133" width="2.8" height="15.0" fill="rgb(250,87,11)" rx="2" ry="2" />
+<text  x="1160.15" y="143.5" ></text>
+</g>
+<g >
+<title>native_write_msr (196 samples, 45.48%)</title><rect x="609.6" y="133" width="536.6" height="15.0" fill="rgb(241,63,40)" rx="2" ry="2" />
+<text  x="612.58" y="143.5" >native_write_msr</text>
+</g>
+<g >
+<title>dequeue_entity (1 samples, 0.23%)</title><rect x="319.4" y="165" width="2.7" height="15.0" fill="rgb(233,133,10)" rx="2" ry="2" />
+<text  x="322.37" y="175.5" ></text>
+</g>
+<g >
+<title>wake_up_process (1 samples, 0.23%)</title><rect x="103.1" y="181" width="2.7" height="15.0" fill="rgb(244,177,13)" rx="2" ry="2" />
+<text  x="106.09" y="191.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (22 samples, 5.10%)</title><rect x="344.0" y="197" width="60.2" height="15.0" fill="rgb(206,15,22)" rx="2" ry="2" />
+<text  x="347.01" y="207.5" >__sche..</text>
+</g>
+<g >
+<title>std::map&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt;, std::less&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt; &gt; &gt; &gt;::lower_bound (1 samples, 0.23%)</title><rect x="64.8" y="181" width="2.7" height="15.0" fill="rgb(248,138,6)" rx="2" ry="2" />
+<text  x="67.76" y="191.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (38 samples, 8.82%)</title><rect x="207.1" y="309" width="104.1" height="15.0" fill="rgb(207,210,6)" rx="2" ry="2" />
+<text  x="210.12" y="319.5" >do_syscall_64</text>
+</g>
+<g >
+<title>std::condition_variable::wait_until&lt;std::chrono::_V2::system_clock, std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000000l&gt; &gt;, drive::common::ipc::LocalShmBusDispatcherImpl::monitorThreadFunc (1 samples, 0.23%)</title><rect x="67.5" y="229" width="2.7" height="15.0" fill="rgb(226,208,46)" rx="2" ry="2" />
+<text  x="70.49" y="239.5" ></text>
+</g>
+<g >
+<title>std::_Rb_tree&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt; &gt;, std::_Select1st&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt; &gt; &gt;, std::less&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt; &gt; &gt; &gt;::_S_left (1 samples, 0.23%)</title><rect x="23.7" y="133" width="2.7" height="15.0" fill="rgb(252,178,35)" rx="2" ry="2" />
+<text  x="26.69" y="143.5" ></text>
+</g>
+<g >
+<title>update_load_avg (1 samples, 0.23%)</title><rect x="319.4" y="149" width="2.7" height="15.0" fill="rgb(210,162,52)" rx="2" ry="2" />
+<text  x="322.37" y="159.5" ></text>
+</g>
+<g >
+<title>do_futex (220 samples, 51.04%)</title><rect x="563.0" y="293" width="602.4" height="15.0" fill="rgb(230,54,28)" rx="2" ry="2" />
+<text  x="566.04" y="303.5" >do_futex</text>
+</g>
+<g >
+<title>dequeue_entity (1 samples, 0.23%)</title><rect x="576.7" y="181" width="2.8" height="15.0" fill="rgb(208,7,11)" rx="2" ry="2" />
+<text  x="579.73" y="191.5" ></text>
+</g>
+<g >
+<title>boost::lockfree::queue&lt;plusai::common::logging::AsyncLogPrinter::WorkItem*&gt;::pop&lt;plusai::common::logging::AsyncLogPrinter::WorkItem*&gt; (1 samples, 0.23%)</title><rect x="89.4" y="197" width="2.7" height="15.0" fill="rgb(238,211,45)" rx="2" ry="2" />
+<text  x="92.40" y="207.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (2 samples, 0.46%)</title><rect x="313.9" y="213" width="5.5" height="15.0" fill="rgb(250,183,15)" rx="2" ry="2" />
+<text  x="316.90" y="223.5" ></text>
+</g>
+<g >
+<title>std::_V2::condition_variable_any::wait_for&lt;drive::common::ipc::LocalShmBus::LockSentry&lt;std::unique_lock&gt;, long, std::ratio&lt;1l, 1000000000l&gt; &gt; (4 samples, 0.93%)</title><rect x="42.9" y="245" width="10.9" height="15.0" fill="rgb(239,122,10)" rx="2" ry="2" />
+<text  x="45.85" y="255.5" ></text>
+</g>
+<g >
+<title>boost::function3&lt;bool, void const*, drive::common::ipc::detail::PublisherImpl*, drive::common::ipc::ShmMessage&amp;&gt;::operator (1 samples, 0.23%)</title><rect x="10.0" y="181" width="2.7" height="15.0" fill="rgb(207,119,18)" rx="2" ry="2" />
+<text  x="13.00" y="191.5" ></text>
+</g>
+<g >
+<title>__fget_light (1 samples, 0.23%)</title><rect x="420.7" y="277" width="2.7" height="15.0" fill="rgb(243,189,31)" rx="2" ry="2" />
+<text  x="423.67" y="287.5" ></text>
+</g>
+<g >
+<title>drive::common::metrics::ScopedTimer::~ScopedTimer (1 samples, 0.23%)</title><rect x="64.8" y="245" width="2.7" height="15.0" fill="rgb(241,223,20)" rx="2" ry="2" />
+<text  x="67.76" y="255.5" ></text>
+</g>
+<g >
+<title>std::chrono::operator-&lt;std::chrono::_V2::system_clock, std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000000l&gt; &gt;, std::chrono::duration&lt;long, std::ratio&lt;1l, 1l&gt; &gt; &gt; (1 samples, 0.23%)</title><rect x="86.7" y="181" width="2.7" height="15.0" fill="rgb(217,56,44)" rx="2" ry="2" />
+<text  x="89.66" y="191.5" ></text>
+</g>
+<g >
+<title>drive::common::metrics::ScopedTimer::~ScopedTimer (1 samples, 0.23%)</title><rect x="40.1" y="245" width="2.8" height="15.0" fill="rgb(225,40,27)" rx="2" ry="2" />
+<text  x="43.12" y="255.5" ></text>
+</g>
+<g >
+<title>native_apic_mem_write (1 samples, 0.23%)</title><rect x="1151.7" y="181" width="2.7" height="15.0" fill="rgb(247,29,29)" rx="2" ry="2" />
+<text  x="1154.67" y="191.5" ></text>
+</g>
+<g >
+<title>perf_event_sched_in (1 samples, 0.23%)</title><rect x="346.8" y="149" width="2.7" height="15.0" fill="rgb(219,137,15)" rx="2" ry="2" />
+<text  x="349.75" y="159.5" ></text>
+</g>
+<g >
+<title>schedule (2 samples, 0.46%)</title><rect x="313.9" y="229" width="5.5" height="15.0" fill="rgb(235,36,32)" rx="2" ry="2" />
+<text  x="316.90" y="239.5" ></text>
+</g>
+<g >
+<title>account_system_index_time (1 samples, 0.23%)</title><rect x="1148.9" y="53" width="2.8" height="15.0" fill="rgb(227,170,53)" rx="2" ry="2" />
+<text  x="1151.93" y="63.5" ></text>
+</g>
+<g >
+<title>schedule_hrtimeout_range_clock (22 samples, 5.10%)</title><rect x="344.0" y="229" width="60.2" height="15.0" fill="rgb(237,161,32)" rx="2" ry="2" />
+<text  x="347.01" y="239.5" >schedu..</text>
+</g>
+<g >
+<title>read (1 samples, 0.23%)</title><rect x="409.7" y="341" width="2.8" height="15.0" fill="rgb(206,10,21)" rx="2" ry="2" />
+<text  x="412.72" y="351.5" ></text>
+</g>
+<g >
+<title>__pthread_rwlock_wrlock (1 samples, 0.23%)</title><rect x="319.4" y="341" width="2.7" height="15.0" fill="rgb(236,18,0)" rx="2" ry="2" />
+<text  x="322.37" y="351.5" ></text>
+</g>
+<g >
+<title>std::chrono::time_point&lt;std::chrono::_V2::system_clock, std::chrono::duration&lt;long, std::ratio&lt;1l, 1l&gt; &gt; &gt;::time_since_epoch (1 samples, 0.23%)</title><rect x="86.7" y="165" width="2.7" height="15.0" fill="rgb(243,74,47)" rx="2" ry="2" />
+<text  x="89.66" y="175.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (34 samples, 7.89%)</title><rect x="105.8" y="181" width="93.1" height="15.0" fill="rgb(238,113,49)" rx="2" ry="2" />
+<text  x="108.82" y="191.5" >__perf_even..</text>
+</g>
+<g >
+<title>hrtimer_active (1 samples, 0.23%)</title><rect x="1162.6" y="245" width="2.8" height="15.0" fill="rgb(240,169,13)" rx="2" ry="2" />
+<text  x="1165.62" y="255.5" ></text>
+</g>
+<g >
+<title>std::__cmpexch_failure_order (1 samples, 0.23%)</title><rect x="53.8" y="197" width="2.7" height="15.0" fill="rgb(237,133,1)" rx="2" ry="2" />
+<text  x="56.81" y="207.5" ></text>
+</g>
+<g >
+<title>perf_event_update_userpage (2 samples, 0.46%)</title><rect x="598.6" y="69" width="5.5" height="15.0" fill="rgb(219,224,34)" rx="2" ry="2" />
+<text  x="601.63" y="79.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (22 samples, 5.10%)</title><rect x="344.0" y="181" width="60.2" height="15.0" fill="rgb(249,218,43)" rx="2" ry="2" />
+<text  x="347.01" y="191.5" >finish..</text>
+</g>
+<g >
+<title>perf_pmu_enable.part.0 (33 samples, 7.66%)</title><rect x="218.1" y="181" width="90.3" height="15.0" fill="rgb(251,16,45)" rx="2" ry="2" />
+<text  x="221.07" y="191.5" >perf_pmu_e..</text>
+</g>
+<g >
+<title>std::condition_variable::wait_for&lt;long, std::ratio&lt;1l, 1000l&gt;, drive::common::ipc::LocalShmBusDispatcherImpl::monitorThreadFunc (1 samples, 0.23%)</title><rect x="67.5" y="245" width="2.7" height="15.0" fill="rgb(239,151,48)" rx="2" ry="2" />
+<text  x="70.49" y="255.5" ></text>
+</g>
+<g >
+<title>std::chrono::operator&lt; &lt;std::chrono::_V2::system_clock, std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000000l&gt; &gt;, std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000000l&gt; &gt; &gt; (1 samples, 0.23%)</title><rect x="83.9" y="197" width="2.8" height="15.0" fill="rgb(211,86,36)" rx="2" ry="2" />
+<text  x="86.92" y="207.5" ></text>
+</g>
+<g >
+<title>perf_swevent_add (1 samples, 0.23%)</title><rect x="434.4" y="85" width="2.7" height="15.0" fill="rgb(214,10,37)" rx="2" ry="2" />
+<text  x="437.36" y="95.5" ></text>
+</g>
+<g >
+<title>__access (1 samples, 0.23%)</title><rect x="56.5" y="229" width="2.8" height="15.0" fill="rgb(207,184,5)" rx="2" ry="2" />
+<text  x="59.54" y="239.5" ></text>
+</g>
+<g >
+<title>group_sched_in (1 samples, 0.23%)</title><rect x="346.8" y="85" width="2.7" height="15.0" fill="rgb(252,48,40)" rx="2" ry="2" />
+<text  x="349.75" y="95.5" ></text>
+</g>
+<g >
+<title>native_sched_clock (1 samples, 0.23%)</title><rect x="571.3" y="149" width="2.7" height="15.0" fill="rgb(211,149,13)" rx="2" ry="2" />
+<text  x="574.25" y="159.5" ></text>
+</g>
+<g >
+<title>std::chrono::time_point_cast&lt;std::chrono::duration&lt;long, std::ratio&lt;1l, 1l&gt; &gt;, std::chrono::_V2::system_clock, std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000000l&gt; &gt; &gt; (1 samples, 0.23%)</title><rect x="78.4" y="181" width="2.8" height="15.0" fill="rgb(241,131,39)" rx="2" ry="2" />
+<text  x="81.45" y="191.5" ></text>
+</g>
+<g >
+<title>std::thread::_Invoker&lt;std::tuple&lt;drive::common::ipc::LocalShmBus::init (15 samples, 3.48%)</title><rect x="12.7" y="309" width="41.1" height="15.0" fill="rgb(222,214,54)" rx="2" ry="2" />
+<text  x="15.74" y="319.5" >std..</text>
+</g>
+<g >
+<title>drive::common::ipc::LocalShmBus::processRosCallbackQueueInjectors (5 samples, 1.16%)</title><rect x="26.4" y="245" width="13.7" height="15.0" fill="rgb(212,61,11)" rx="2" ry="2" />
+<text  x="29.43" y="255.5" ></text>
+</g>
+<g >
+<title>std::thread::_Invoker&lt;std::tuple&lt;drive::common::ipc::LocalShmBus::init (15 samples, 3.48%)</title><rect x="12.7" y="325" width="41.1" height="15.0" fill="rgb(220,135,3)" rx="2" ry="2" />
+<text  x="15.74" y="335.5" >std..</text>
+</g>
+<g >
+<title>_raw_spin_lock_irqsave (1 samples, 0.23%)</title><rect x="209.9" y="213" width="2.7" height="15.0" fill="rgb(228,124,28)" rx="2" ry="2" />
+<text  x="212.86" y="223.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (33 samples, 7.66%)</title><rect x="417.9" y="325" width="90.4" height="15.0" fill="rgb(236,92,33)" rx="2" ry="2" />
+<text  x="420.94" y="335.5" >do_syscall..</text>
+</g>
+<g >
+<title>epoll_wait (27 samples, 6.26%)</title><rect x="333.1" y="341" width="73.9" height="15.0" fill="rgb(209,26,14)" rx="2" ry="2" />
+<text  x="336.06" y="351.5" >epoll_wait</text>
+</g>
+<g >
+<title>rb_next (1 samples, 0.23%)</title><rect x="1146.2" y="117" width="2.7" height="15.0" fill="rgb(238,142,27)" rx="2" ry="2" />
+<text  x="1149.19" y="127.5" ></text>
+</g>
+<g >
+<title>std::condition_variable::wait_until&lt;std::chrono::_V2::system_clock, std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000000l&gt; &gt;, drive::common::periodics::Scheduler::WorkerPool::runCallbacksUntilDead (2 samples, 0.46%)</title><rect x="83.9" y="229" width="5.5" height="15.0" fill="rgb(228,84,23)" rx="2" ry="2" />
+<text  x="86.92" y="239.5" ></text>
+</g>
+<g >
+<title>x86_pmu_enable (196 samples, 45.48%)</title><rect x="609.6" y="165" width="536.6" height="15.0" fill="rgb(242,11,23)" rx="2" ry="2" />
+<text  x="612.58" y="175.5" >x86_pmu_enable</text>
+</g>
+<g >
+<title>[unknown] (3 samples, 0.70%)</title><rect x="324.8" y="325" width="8.3" height="15.0" fill="rgb(224,226,34)" rx="2" ry="2" />
+<text  x="327.85" y="335.5" ></text>
+</g>
+<g >
+<title>get_futex_value_locked (1 samples, 0.23%)</title><rect x="1159.9" y="245" width="2.7" height="15.0" fill="rgb(246,98,50)" rx="2" ry="2" />
+<text  x="1162.88" y="255.5" ></text>
+</g>
+<g >
+<title>drive::common::periodics::Scheduler::WorkerPool::runCallbacksUntilDead (3 samples, 0.70%)</title><rect x="81.2" y="261" width="8.2" height="15.0" fill="rgb(222,125,27)" rx="2" ry="2" />
+<text  x="84.18" y="271.5" ></text>
+</g>
+<g >
+<title>std::condition_variable::__wait_until_impl&lt;std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000000l&gt; &gt; &gt; (1 samples, 0.23%)</title><rect x="51.1" y="197" width="2.7" height="15.0" fill="rgb(228,176,4)" rx="2" ry="2" />
+<text  x="54.07" y="207.5" ></text>
+</g>
+<g >
+<title>perf_event_sched_in (1 samples, 0.23%)</title><rect x="313.9" y="165" width="2.7" height="15.0" fill="rgb(249,49,33)" rx="2" ry="2" />
+<text  x="316.90" y="175.5" ></text>
+</g>
+<g >
+<title>ctx_sched_in (1 samples, 0.23%)</title><rect x="346.8" y="133" width="2.7" height="15.0" fill="rgb(212,73,30)" rx="2" ry="2" />
+<text  x="349.75" y="143.5" ></text>
+</g>
+<g >
+<title>do_mq_timedreceive (35 samples, 8.12%)</title><rect x="103.1" y="277" width="95.8" height="15.0" fill="rgb(230,4,43)" rx="2" ry="2" />
+<text  x="106.09" y="287.5" >do_mq_timed..</text>
+</g>
+<g >
+<title>std::condition_variable::wait_for&lt;double, std::ratio&lt;1l, 1l&gt;, drive::common::ipc::PubSubSpinner::shmBusPollThreadFunc (1 samples, 0.23%)</title><rect x="78.4" y="245" width="2.8" height="15.0" fill="rgb(217,148,37)" rx="2" ry="2" />
+<text  x="81.45" y="255.5" ></text>
+</g>
+<g >
+<title>drive::common::ipc::detail::advertise (1 samples, 0.23%)</title><rect x="10.0" y="149" width="2.7" height="15.0" fill="rgb(216,185,11)" rx="2" ry="2" />
+<text  x="13.00" y="159.5" ></text>
+</g>
+<g >
+<title>smp_apic_timer_interrupt (1 samples, 0.23%)</title><rect x="103.1" y="245" width="2.7" height="15.0" fill="rgb(250,70,18)" rx="2" ry="2" />
+<text  x="106.09" y="255.5" ></text>
+</g>
+<g >
+<title>__vdso_clock_gettime (1 samples, 0.23%)</title><rect x="322.1" y="341" width="2.7" height="15.0" fill="rgb(240,206,13)" rx="2" ry="2" />
+<text  x="325.11" y="351.5" ></text>
+</g>
+<g >
+<title>native_sched_clock (1 samples, 0.23%)</title><rect x="426.1" y="133" width="2.8" height="15.0" fill="rgb(248,101,15)" rx="2" ry="2" />
+<text  x="429.15" y="143.5" ></text>
+</g>
+<g >
+<title>plusai::common::logging::AsyncLogPrinter::printerThreadFunc (3 samples, 0.70%)</title><rect x="89.4" y="261" width="8.2" height="15.0" fill="rgb(253,204,48)" rx="2" ry="2" />
+<text  x="92.40" y="271.5" ></text>
+</g>
+<g >
+<title>[unknown] (116 samples, 26.91%)</title><rect x="100.3" y="357" width="317.6" height="15.0" fill="rgb(228,187,30)" rx="2" ry="2" />
+<text  x="103.35" y="367.5" >[unknown]</text>
+</g>
+<g >
+<title>do_nanosleep (36 samples, 8.35%)</title><rect x="209.9" y="261" width="98.5" height="15.0" fill="rgb(247,55,18)" rx="2" ry="2" />
+<text  x="212.86" y="271.5" >do_nanosleep</text>
+</g>
+<g >
+<title>std::chrono::duration&lt;long, std::ratio&lt;1l, 1l&gt; &gt;::duration&lt;long, void&gt; (1 samples, 0.23%)</title><rect x="201.6" y="197" width="2.8" height="15.0" fill="rgb(229,109,50)" rx="2" ry="2" />
+<text  x="204.65" y="207.5" ></text>
+</g>
+<g >
+<title>std::__invoke&lt;IpcBenchmarkProgram::go (1 samples, 0.23%)</title><rect x="10.0" y="293" width="2.7" height="15.0" fill="rgb(240,49,23)" rx="2" ry="2" />
+<text  x="13.00" y="303.5" ></text>
+</g>
+<g >
+<title>std::condition_variable::wait_until&lt;std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000000l&gt; &gt; &gt; (1 samples, 0.23%)</title><rect x="78.4" y="213" width="2.8" height="15.0" fill="rgb(244,115,8)" rx="2" ry="2" />
+<text  x="81.45" y="223.5" ></text>
+</g>
+<g >
+<title>XmlRpc::XmlRpcDispatch::getTime (1 samples, 0.23%)</title><rect x="1187.3" y="341" width="2.7" height="15.0" fill="rgb(246,187,48)" rx="2" ry="2" />
+<text  x="1190.26" y="351.5" ></text>
+</g>
+<g >
+<title>hrtimer_wakeup (1 samples, 0.23%)</title><rect x="103.1" y="197" width="2.7" height="15.0" fill="rgb(218,148,3)" rx="2" ry="2" />
+<text  x="106.09" y="207.5" ></text>
+</g>
+<g >
+<title>drive::common::ipc::PIDSpinlock::tryLock (1 samples, 0.23%)</title><rect x="53.8" y="229" width="2.7" height="15.0" fill="rgb(231,13,45)" rx="2" ry="2" />
+<text  x="56.81" y="239.5" ></text>
+</g>
+<g >
+<title>std::__invoke_impl&lt;void, IpcBenchmarkProgram::go (1 samples, 0.23%)</title><rect x="10.0" y="277" width="2.7" height="15.0" fill="rgb(252,9,27)" rx="2" ry="2" />
+<text  x="13.00" y="287.5" ></text>
+</g>
+<g >
+<title>pthread_cond_timedwait@@GLIBC_2.3.2 (246 samples, 57.08%)</title><rect x="513.8" y="357" width="673.5" height="15.0" fill="rgb(218,156,26)" rx="2" ry="2" />
+<text  x="516.76" y="367.5" >pthread_cond_timedwait@@GLIBC_2.3.2</text>
+</g>
+<g >
+<title>x86_pmu_enable (20 samples, 4.64%)</title><rect x="349.5" y="133" width="54.7" height="15.0" fill="rgb(251,199,41)" rx="2" ry="2" />
+<text  x="352.49" y="143.5" >x86_p..</text>
+</g>
+<g >
+<title>schedule_hrtimeout_range_clock (34 samples, 7.89%)</title><rect x="105.8" y="245" width="93.1" height="15.0" fill="rgb(205,191,20)" rx="2" ry="2" />
+<text  x="108.82" y="255.5" >schedule_hr..</text>
+</g>
+<g >
+<title>futex_wait_queue_me (2 samples, 0.46%)</title><rect x="313.9" y="245" width="5.5" height="15.0" fill="rgb(225,52,54)" rx="2" ry="2" />
+<text  x="316.90" y="255.5" ></text>
+</g>
+<g >
+<title>perf_pmu_enable.part.0 (24 samples, 5.57%)</title><rect x="437.1" y="165" width="65.7" height="15.0" fill="rgb(227,9,9)" rx="2" ry="2" />
+<text  x="440.10" y="175.5" >perf_pm..</text>
+</g>
+<g >
+<title>__x64_sys_futex (2 samples, 0.46%)</title><rect x="313.9" y="293" width="5.5" height="15.0" fill="rgb(240,4,12)" rx="2" ry="2" />
+<text  x="316.90" y="303.5" ></text>
+</g>
+<g >
+<title>boost::thread_detail::enter_once_region (1 samples, 0.23%)</title><rect x="511.0" y="357" width="2.8" height="15.0" fill="rgb(205,5,47)" rx="2" ry="2" />
+<text  x="514.02" y="367.5" ></text>
+</g>
+<g >
+<title>vfs_read (1 samples, 0.23%)</title><rect x="409.7" y="261" width="2.8" height="15.0" fill="rgb(233,111,20)" rx="2" ry="2" />
+<text  x="412.72" y="271.5" ></text>
+</g>
+<g >
+<title>drive::common::metrics::ScopedTimer::~ScopedTimer (3 samples, 0.70%)</title><rect x="18.2" y="229" width="8.2" height="15.0" fill="rgb(232,222,8)" rx="2" ry="2" />
+<text  x="21.21" y="239.5" ></text>
+</g>
+<g >
+<title>drive::common::metrics::Registry::scoped_function_timer_log (1 samples, 0.23%)</title><rect x="62.0" y="245" width="2.8" height="15.0" fill="rgb(248,57,27)" rx="2" ry="2" />
+<text  x="65.02" y="255.5" ></text>
+</g>
+<g >
+<title>IpcBenchmarkProgram::go (1 samples, 0.23%)</title><rect x="10.0" y="261" width="2.7" height="15.0" fill="rgb(222,193,3)" rx="2" ry="2" />
+<text  x="13.00" y="271.5" ></text>
+</g>
+<g >
+<title>deactivate_task (1 samples, 0.23%)</title><rect x="426.1" y="197" width="2.8" height="15.0" fill="rgb(242,127,39)" rx="2" ry="2" />
+<text  x="429.15" y="207.5" ></text>
+</g>
+<g >
+<title>tick_sched_handle (1 samples, 0.23%)</title><rect x="1148.9" y="117" width="2.8" height="15.0" fill="rgb(215,124,42)" rx="2" ry="2" />
+<text  x="1151.93" y="127.5" ></text>
+</g>
+<g >
+<title>std::_V2::condition_variable_any::wait_until&lt;drive::common::ipc::LocalShmBus::LockSentry&lt;std::unique_lock&gt;, std::chrono::_V2::system_clock, std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000000l&gt; &gt; &gt; (4 samples, 0.93%)</title><rect x="42.9" y="229" width="10.9" height="15.0" fill="rgb(220,45,2)" rx="2" ry="2" />
+<text  x="45.85" y="239.5" ></text>
+</g>
+<g >
+<title>seq_read (1 samples, 0.23%)</title><rect x="409.7" y="229" width="2.8" height="15.0" fill="rgb(206,114,24)" rx="2" ry="2" />
+<text  x="412.72" y="239.5" ></text>
+</g>
+<g >
+<title>std::__invoke_impl&lt;void, void  (17 samples, 3.94%)</title><rect x="53.8" y="277" width="46.5" height="15.0" fill="rgb(225,202,30)" rx="2" ry="2" />
+<text  x="56.81" y="287.5" >std:..</text>
+</g>
+<g >
+<title>std::unique_ptr&lt;drive::common::ipc::GlobalShmBusImpl, std::default_delete&lt;drive::common::ipc::GlobalShmBusImpl&gt; &gt;::operator* (1 samples, 0.23%)</title><rect x="26.4" y="213" width="2.8" height="15.0" fill="rgb(206,189,35)" rx="2" ry="2" />
+<text  x="29.43" y="223.5" ></text>
+</g>
+<g >
+<title>std::this_thread::sleep_for&lt;long, std::ratio&lt;1l, 1000l&gt; &gt; (2 samples, 0.46%)</title><rect x="198.9" y="229" width="5.5" height="15.0" fill="rgb(217,214,50)" rx="2" ry="2" />
+<text  x="201.91" y="239.5" ></text>
+</g>
+<g >
+<title>visit_groups_merge (1 samples, 0.23%)</title><rect x="108.6" y="133" width="2.7" height="15.0" fill="rgb(244,54,28)" rx="2" ry="2" />
+<text  x="111.56" y="143.5" ></text>
+</g>
+<g >
+<title>std::_Rb_tree&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt; &gt;, std::_Select1st&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt; &gt; &gt;, std::less&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt; &gt; &gt; &gt;::lower_bound (1 samples, 0.23%)</title><rect x="23.7" y="149" width="2.7" height="15.0" fill="rgb(207,171,28)" rx="2" ry="2" />
+<text  x="26.69" y="159.5" ></text>
+</g>
+<g >
+<title>poll_schedule_timeout.constprop.0 (29 samples, 6.73%)</title><rect x="423.4" y="277" width="79.4" height="15.0" fill="rgb(220,115,4)" rx="2" ry="2" />
+<text  x="426.41" y="287.5" >poll_sche..</text>
+</g>
+<g >
+<title>visit_groups_merge (1 samples, 0.23%)</title><rect x="212.6" y="149" width="2.7" height="15.0" fill="rgb(209,98,7)" rx="2" ry="2" />
+<text  x="215.60" y="159.5" ></text>
+</g>
+<g >
+<title>record_times (1 samples, 0.23%)</title><rect x="426.1" y="165" width="2.8" height="15.0" fill="rgb(240,228,30)" rx="2" ry="2" />
+<text  x="429.15" y="175.5" ></text>
+</g>
+<g >
+<title>boost::lockfree::queue&lt;plusai::common::logging::AsyncLogPrinter::WorkItem*&gt;::pop (1 samples, 0.23%)</title><rect x="89.4" y="213" width="2.7" height="15.0" fill="rgb(226,167,25)" rx="2" ry="2" />
+<text  x="92.40" y="223.5" ></text>
+</g>
+<g >
+<title>std::_Rb_tree&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt; &gt;, std::_Select1st&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt; &gt; &gt;, std::less&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt; &gt; &gt; &gt;::lower_bound (1 samples, 0.23%)</title><rect x="64.8" y="165" width="2.7" height="15.0" fill="rgb(239,128,24)" rx="2" ry="2" />
+<text  x="67.76" y="175.5" ></text>
+</g>
+<g >
+<title>std::unique_lock&lt;std::mutex&gt;::~unique_lock (1 samples, 0.23%)</title><rect x="97.6" y="261" width="2.7" height="15.0" fill="rgb(247,201,37)" rx="2" ry="2" />
+<text  x="100.61" y="271.5" ></text>
+</g>
+<g >
+<title>ksys_read (1 samples, 0.23%)</title><rect x="409.7" y="277" width="2.8" height="15.0" fill="rgb(243,101,14)" rx="2" ry="2" />
+<text  x="412.72" y="287.5" ></text>
+</g>
+<g >
+<title>perf_swevent_add (1 samples, 0.23%)</title><rect x="604.1" y="101" width="2.7" height="15.0" fill="rgb(221,154,15)" rx="2" ry="2" />
+<text  x="607.11" y="111.5" ></text>
+</g>
+<g >
+<title>smp_apic_timer_interrupt (2 samples, 0.46%)</title><rect x="1146.2" y="181" width="5.5" height="15.0" fill="rgb(226,90,18)" rx="2" ry="2" />
+<text  x="1149.19" y="191.5" ></text>
+</g>
+<g >
+<title>drive::common::ipc::ShmBusNodeMetadata::isAlive (2 samples, 0.46%)</title><rect x="56.5" y="245" width="5.5" height="15.0" fill="rgb(217,196,23)" rx="2" ry="2" />
+<text  x="59.54" y="255.5" ></text>
+</g>
+<g >
+<title>drive::common::ipc::PubSubSpinner::shmBusPollThreadFunc (4 samples, 0.93%)</title><rect x="70.2" y="261" width="11.0" height="15.0" fill="rgb(227,67,31)" rx="2" ry="2" />
+<text  x="73.23" y="271.5" ></text>
+</g>
+<g >
+<title>pick_next_task_idle (1 samples, 0.23%)</title><rect x="316.6" y="197" width="2.8" height="15.0" fill="rgb(212,186,7)" rx="2" ry="2" />
+<text  x="319.64" y="207.5" ></text>
+</g>
+<g >
+<title>std::mutex::unlock (1 samples, 0.23%)</title><rect x="94.9" y="229" width="2.7" height="15.0" fill="rgb(206,185,35)" rx="2" ry="2" />
+<text  x="97.87" y="239.5" ></text>
+</g>
+<g >
+<title>plusai::common::logging::AsyncLogPrinter::flushOne (1 samples, 0.23%)</title><rect x="89.4" y="229" width="2.7" height="15.0" fill="rgb(211,129,35)" rx="2" ry="2" />
+<text  x="92.40" y="239.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (29 samples, 6.73%)</title><rect x="423.4" y="213" width="79.4" height="15.0" fill="rgb(213,110,13)" rx="2" ry="2" />
+<text  x="426.41" y="223.5" >__sched_t..</text>
+</g>
+<g >
+<title>LockFreeAppendOnlyHashMap&lt;drive::common::metrics::LogTimer, 65536ul&gt;::insert&lt;boost::basic_string_view&lt;char, std::char_traits&lt;char&gt; &gt;&amp;, boost::basic_string_view&lt;char, std::char_traits&lt;char&gt; &gt;&amp;&gt; (1 samples, 0.23%)</title><rect x="29.2" y="213" width="2.7" height="15.0" fill="rgb(238,177,46)" rx="2" ry="2" />
+<text  x="32.16" y="223.5" ></text>
+</g>
+<g >
+<title>native_write_msr (20 samples, 4.64%)</title><rect x="349.5" y="101" width="54.7" height="15.0" fill="rgb(206,226,3)" rx="2" ry="2" />
+<text  x="352.49" y="111.5" >nativ..</text>
+</g>
+<g >
+<title>native_write_msr (24 samples, 5.57%)</title><rect x="437.1" y="117" width="65.7" height="15.0" fill="rgb(213,122,6)" rx="2" ry="2" />
+<text  x="440.10" y="127.5" >native_..</text>
+</g>
+<g >
+<title>drive::common::ipc::spin (3 samples, 0.70%)</title><rect x="198.9" y="277" width="8.2" height="15.0" fill="rgb(239,195,54)" rx="2" ry="2" />
+<text  x="201.91" y="287.5" ></text>
+</g>
+<g >
+<title>ctx_sched_in (7 samples, 1.62%)</title><rect x="587.7" y="165" width="19.1" height="15.0" fill="rgb(240,89,8)" rx="2" ry="2" />
+<text  x="590.68" y="175.5" ></text>
+</g>
+<g >
+<title>proc_pid_status (1 samples, 0.23%)</title><rect x="409.7" y="197" width="2.8" height="15.0" fill="rgb(235,192,7)" rx="2" ry="2" />
+<text  x="412.72" y="207.5" ></text>
+</g>
+<g >
+<title>perf_event_sched_in (7 samples, 1.62%)</title><rect x="587.7" y="181" width="19.1" height="15.0" fill="rgb(250,146,35)" rx="2" ry="2" />
+<text  x="590.68" y="191.5" ></text>
+</g>
+<g >
+<title>__remove_hrtimer (1 samples, 0.23%)</title><rect x="1146.2" y="133" width="2.7" height="15.0" fill="rgb(211,21,32)" rx="2" ry="2" />
+<text  x="1149.19" y="143.5" ></text>
+</g>
+<g >
+<title>task_state (1 samples, 0.23%)</title><rect x="409.7" y="181" width="2.8" height="15.0" fill="rgb(246,99,50)" rx="2" ry="2" />
+<text  x="412.72" y="191.5" ></text>
+</g>
+<g >
+<title>hrtimer_nanosleep (36 samples, 8.35%)</title><rect x="209.9" y="277" width="98.5" height="15.0" fill="rgb(229,62,45)" rx="2" ry="2" />
+<text  x="212.86" y="287.5" >hrtimer_nan..</text>
+</g>
+<g >
+<title>std::unique_lock&lt;std::mutex&gt;::unlock (1 samples, 0.23%)</title><rect x="94.9" y="245" width="2.7" height="15.0" fill="rgb(248,94,50)" rx="2" ry="2" />
+<text  x="97.87" y="255.5" ></text>
+</g>
+<g >
+<title>std::unique_ptr&lt;LockFreeAppendOnlyHashMap&lt;drive::common::metrics::LogTimer, 65536ul&gt;::Entry, std::default_delete&lt;LockFreeAppendOnlyHashMap&lt;drive::common::metrics::LogTimer, 65536ul&gt;::Entry&gt; &gt;::~unique_ptr (1 samples, 0.23%)</title><rect x="62.0" y="197" width="2.8" height="15.0" fill="rgb(210,13,5)" rx="2" ry="2" />
+<text  x="65.02" y="207.5" ></text>
+</g>
+<g >
+<title>drive::common::ipc::detail::PublisherImpl::publish (1 samples, 0.23%)</title><rect x="10.0" y="213" width="2.7" height="15.0" fill="rgb(252,79,16)" rx="2" ry="2" />
+<text  x="13.00" y="223.5" ></text>
+</g>
+<g >
+<title>perf_pmu_enable.part.0 (32 samples, 7.42%)</title><rect x="111.3" y="165" width="87.6" height="15.0" fill="rgb(221,7,5)" rx="2" ry="2" />
+<text  x="114.30" y="175.5" >perf_pmu_e..</text>
+</g>
+<g >
+<title>do_syscall_64 (229 samples, 53.13%)</title><rect x="541.1" y="325" width="627.0" height="15.0" fill="rgb(214,17,53)" rx="2" ry="2" />
+<text  x="544.14" y="335.5" >do_syscall_64</text>
+</g>
+<g >
+<title>drive::common::ipc::Publisher::publish&lt;std_msgs::String_&lt;std::allocator&lt;void&gt; &gt;&amp;, 1&gt; (1 samples, 0.23%)</title><rect x="10.0" y="245" width="2.7" height="15.0" fill="rgb(231,9,5)" rx="2" ry="2" />
+<text  x="13.00" y="255.5" ></text>
+</g>
+<g >
+<title>schedule_hrtimeout_range (29 samples, 6.73%)</title><rect x="423.4" y="261" width="79.4" height="15.0" fill="rgb(245,164,3)" rx="2" ry="2" />
+<text  x="426.41" y="271.5" >schedule_..</text>
+</g>
+<g >
+<title>drive::common::metrics::ScopedTimer::stop (1 samples, 0.23%)</title><rect x="10.0" y="117" width="2.7" height="15.0" fill="rgb(222,35,17)" rx="2" ry="2" />
+<text  x="13.00" y="127.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (1 samples, 0.23%)</title><rect x="94.9" y="181" width="2.7" height="15.0" fill="rgb(230,139,4)" rx="2" ry="2" />
+<text  x="97.87" y="191.5" ></text>
+</g>
+<g >
+<title>group_sched_in (1 samples, 0.23%)</title><rect x="434.4" y="101" width="2.7" height="15.0" fill="rgb(222,198,0)" rx="2" ry="2" />
+<text  x="437.36" y="111.5" ></text>
+</g>
+<g >
+<title>std::_Rb_tree&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt; &gt;, std::_Select1st&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt; &gt; &gt;, std::less&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt; &gt; &gt; &gt;::_S_value (1 samples, 0.23%)</title><rect x="64.8" y="133" width="2.7" height="15.0" fill="rgb(250,30,50)" rx="2" ry="2" />
+<text  x="67.76" y="143.5" ></text>
+</g>
+<g >
+<title>newidle_balance (1 samples, 0.23%)</title><rect x="1154.4" y="213" width="2.7" height="15.0" fill="rgb(246,149,47)" rx="2" ry="2" />
+<text  x="1157.41" y="223.5" ></text>
+</g>
+<g >
+<title>std::thread::_Invoker&lt;std::tuple&lt;void  (17 samples, 3.94%)</title><rect x="53.8" y="325" width="46.5" height="15.0" fill="rgb(207,216,41)" rx="2" ry="2" />
+<text  x="56.81" y="335.5" >std:..</text>
+</g>
+<g >
+<title>std::thread::_State_impl&lt;std::thread::_Invoker&lt;std::tuple&lt;void  (17 samples, 3.94%)</title><rect x="53.8" y="341" width="46.5" height="15.0" fill="rgb(216,126,14)" rx="2" ry="2" />
+<text  x="56.81" y="351.5" >std:..</text>
+</g>
+<g >
+<title>__lll_unlock_wake (1 samples, 0.23%)</title><rect x="94.9" y="213" width="2.7" height="15.0" fill="rgb(221,194,2)" rx="2" ry="2" />
+<text  x="97.87" y="223.5" ></text>
+</g>
+<g >
+<title>std::thread::_State_impl&lt;std::thread::_Invoker&lt;std::tuple&lt;drive::common::ipc::LocalShmBus::init (15 samples, 3.48%)</title><rect x="12.7" y="341" width="41.1" height="15.0" fill="rgb(212,215,6)" rx="2" ry="2" />
+<text  x="15.74" y="351.5" >std..</text>
+</g>
+<g >
+<title>std::_Hash_impl::hash (1 samples, 0.23%)</title><rect x="29.2" y="165" width="2.7" height="15.0" fill="rgb(254,12,36)" rx="2" ry="2" />
+<text  x="32.16" y="175.5" ></text>
+</g>
+<g >
+<title>activate_task (1 samples, 0.23%)</title><rect x="103.1" y="133" width="2.7" height="15.0" fill="rgb(244,139,44)" rx="2" ry="2" />
+<text  x="106.09" y="143.5" ></text>
+</g>
+<g >
+<title>perf_pmu_enable.part.0 (20 samples, 4.64%)</title><rect x="349.5" y="149" width="54.7" height="15.0" fill="rgb(245,60,37)" rx="2" ry="2" />
+<text  x="352.49" y="159.5" >perf_..</text>
+</g>
+<g >
+<title>do_syscall_64 (2 samples, 0.46%)</title><rect x="313.9" y="309" width="5.5" height="15.0" fill="rgb(209,65,13)" rx="2" ry="2" />
+<text  x="316.90" y="319.5" ></text>
+</g>
+<g >
+<title>drive::common::metrics::LogTimer::update (1 samples, 0.23%)</title><rect x="10.0" y="101" width="2.7" height="15.0" fill="rgb(249,105,54)" rx="2" ry="2" />
+<text  x="13.00" y="111.5" ></text>
+</g>
+<g >
+<title>proc_single_show (1 samples, 0.23%)</title><rect x="409.7" y="213" width="2.8" height="15.0" fill="rgb(234,44,35)" rx="2" ry="2" />
+<text  x="412.72" y="223.5" ></text>
+</g>
+<g >
+<title>__x64_sys_futex (1 samples, 0.23%)</title><rect x="94.9" y="165" width="2.7" height="15.0" fill="rgb(209,31,3)" rx="2" ry="2" />
+<text  x="97.87" y="175.5" ></text>
+</g>
+<g >
+<title>seq_put_decimal_ull_width (1 samples, 0.23%)</title><rect x="409.7" y="149" width="2.8" height="15.0" fill="rgb(216,71,50)" rx="2" ry="2" />
+<text  x="412.72" y="159.5" ></text>
+</g>
+<g >
+<title>__pthread_rwlock_rdlock (2 samples, 0.46%)</title><rect x="313.9" y="341" width="5.5" height="15.0" fill="rgb(230,131,12)" rx="2" ry="2" />
+<text  x="316.90" y="351.5" ></text>
+</g>
+<g >
+<title>schedule (35 samples, 8.12%)</title><rect x="212.6" y="245" width="95.8" height="15.0" fill="rgb(246,28,50)" rx="2" ry="2" />
+<text  x="215.60" y="255.5" >schedule</text>
+</g>
+<g >
+<title>set_next_task_idle (1 samples, 0.23%)</title><rect x="316.6" y="181" width="2.8" height="15.0" fill="rgb(209,182,16)" rx="2" ry="2" />
+<text  x="319.64" y="191.5" ></text>
+</g>
+<g >
+<title>ros::XMLRPCManager::serverThreadFunc (1 samples, 0.23%)</title><rect x="1187.3" y="357" width="2.7" height="15.0" fill="rgb(234,146,14)" rx="2" ry="2" />
+<text  x="1190.26" y="367.5" ></text>
+</g>
+<g >
+<title>__x64_sys_futex (1 samples, 0.23%)</title><rect x="319.4" y="293" width="2.7" height="15.0" fill="rgb(244,58,9)" rx="2" ry="2" />
+<text  x="322.37" y="303.5" ></text>
+</g>
+<g >
+<title>schedule (34 samples, 7.89%)</title><rect x="105.8" y="229" width="93.1" height="15.0" fill="rgb(232,133,19)" rx="2" ry="2" />
+<text  x="108.82" y="239.5" >schedule</text>
+</g>
+<g >
+<title>dequeue_task_fair (2 samples, 0.46%)</title><rect x="574.0" y="197" width="5.5" height="15.0" fill="rgb(244,176,42)" rx="2" ry="2" />
+<text  x="576.99" y="207.5" ></text>
+</g>
+<g >
+<title>std::__uniq_ptr_impl&lt;drive::common::ipc::GlobalShmBusImpl, std::default_delete&lt;drive::common::ipc::GlobalShmBusImpl&gt; &gt;::_M_ptr (1 samples, 0.23%)</title><rect x="26.4" y="181" width="2.8" height="15.0" fill="rgb(212,195,45)" rx="2" ry="2" />
+<text  x="29.43" y="191.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_out (2 samples, 0.46%)</title><rect x="568.5" y="213" width="5.5" height="15.0" fill="rgb(208,174,22)" rx="2" ry="2" />
+<text  x="571.52" y="223.5" ></text>
+</g>
+<g >
+<title>std::get&lt;0ul, drive::common::ipc::GlobalShmBusImpl*, std::default_delete&lt;drive::common::ipc::GlobalShmBusImpl&gt; &gt; (1 samples, 0.23%)</title><rect x="26.4" y="165" width="2.8" height="15.0" fill="rgb(230,213,35)" rx="2" ry="2" />
+<text  x="29.43" y="175.5" ></text>
+</g>
+<g >
+<title>__tls_get_addr (2 samples, 0.46%)</title><rect x="42.9" y="213" width="5.4" height="15.0" fill="rgb(238,77,50)" rx="2" ry="2" />
+<text  x="45.85" y="223.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (209 samples, 48.49%)</title><rect x="582.2" y="213" width="572.2" height="15.0" fill="rgb(205,155,28)" rx="2" ry="2" />
+<text  x="585.20" y="223.5" >finish_task_switch</text>
+</g>
+<g >
+<title>sock_poll (1 samples, 0.23%)</title><rect x="505.5" y="293" width="2.8" height="15.0" fill="rgb(226,193,32)" rx="2" ry="2" />
+<text  x="508.55" y="303.5" ></text>
+</g>
+<g >
+<title>syscall_return_via_sysret (1 samples, 0.23%)</title><rect x="404.2" y="325" width="2.8" height="15.0" fill="rgb(220,10,31)" rx="2" ry="2" />
+<text  x="407.25" y="335.5" ></text>
+</g>
+<g >
+<title>__libc_start_main (3 samples, 0.70%)</title><rect x="198.9" y="341" width="8.2" height="15.0" fill="rgb(224,43,1)" rx="2" ry="2" />
+<text  x="201.91" y="351.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (1 samples, 0.23%)</title><rect x="313.9" y="197" width="2.7" height="15.0" fill="rgb(245,97,5)" rx="2" ry="2" />
+<text  x="316.90" y="207.5" ></text>
+</g>
+<g >
+<title>perf_event_update_userpage (1 samples, 0.23%)</title><rect x="346.8" y="37" width="2.7" height="15.0" fill="rgb(242,151,40)" rx="2" ry="2" />
+<text  x="349.75" y="47.5" ></text>
+</g>
+<g >
+<title>drive::common::ipc::PIDSpinlock::tryLock (1 samples, 0.23%)</title><rect x="53.8" y="213" width="2.7" height="15.0" fill="rgb(239,178,27)" rx="2" ry="2" />
+<text  x="56.81" y="223.5" ></text>
+</g>
+<g >
+<title>std::chrono::operator&lt; &lt;long, std::ratio&lt;1l, 1000000000l&gt;, long, std::ratio&lt;1l, 1000000l&gt; &gt; (1 samples, 0.23%)</title><rect x="81.2" y="245" width="2.7" height="15.0" fill="rgb(212,12,18)" rx="2" ry="2" />
+<text  x="84.18" y="255.5" ></text>
+</g>
+<g >
+<title>lock_hrtimer_base (1 samples, 0.23%)</title><rect x="209.9" y="229" width="2.7" height="15.0" fill="rgb(252,87,15)" rx="2" ry="2" />
+<text  x="212.86" y="239.5" ></text>
+</g>
+<g >
+<title>account_process_tick (1 samples, 0.23%)</title><rect x="1148.9" y="85" width="2.8" height="15.0" fill="rgb(254,75,43)" rx="2" ry="2" />
+<text  x="1151.93" y="95.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (1 samples, 0.23%)</title><rect x="56.5" y="213" width="2.8" height="15.0" fill="rgb(224,0,22)" rx="2" ry="2" />
+<text  x="59.54" y="223.5" ></text>
+</g>
+<g >
+<title>std::__invoke&lt;drive::common::ipc::LocalShmBus::init (15 samples, 3.48%)</title><rect x="12.7" y="293" width="41.1" height="15.0" fill="rgb(252,208,52)" rx="2" ry="2" />
+<text  x="15.74" y="303.5" >std..</text>
+</g>
+<g >
+<title>std::condition_variable::wait_until&lt;std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000000l&gt; &gt; &gt; (1 samples, 0.23%)</title><rect x="67.5" y="213" width="2.7" height="15.0" fill="rgb(209,72,24)" rx="2" ry="2" />
+<text  x="70.49" y="223.5" ></text>
+</g>
+<g >
+<title>std::__shared_ptr_access&lt;std::mutex,  (1 samples, 0.23%)</title><rect x="48.3" y="213" width="2.8" height="15.0" fill="rgb(221,84,32)" rx="2" ry="2" />
+<text  x="51.33" y="223.5" ></text>
+</g>
+<g >
+<title>futex_wait (2 samples, 0.46%)</title><rect x="313.9" y="261" width="5.5" height="15.0" fill="rgb(205,60,13)" rx="2" ry="2" />
+<text  x="316.90" y="271.5" ></text>
+</g>
+<g >
+<title>__x64_sys_access (1 samples, 0.23%)</title><rect x="56.5" y="197" width="2.8" height="15.0" fill="rgb(242,70,40)" rx="2" ry="2" />
+<text  x="59.54" y="207.5" ></text>
+</g>
+<g >
+<title>perf_pmu_disable.part.0 (1 samples, 0.23%)</title><rect x="215.3" y="181" width="2.8" height="15.0" fill="rgb(231,110,13)" rx="2" ry="2" />
+<text  x="218.34" y="191.5" ></text>
+</g>
+<g >
+<title>flexible_sched_in (1 samples, 0.23%)</title><rect x="434.4" y="117" width="2.7" height="15.0" fill="rgb(249,47,30)" rx="2" ry="2" />
+<text  x="437.36" y="127.5" ></text>
+</g>
+<g >
+<title>IpcBenchmarkProgram::go (3 samples, 0.70%)</title><rect x="198.9" y="293" width="8.2" height="15.0" fill="rgb(207,228,29)" rx="2" ry="2" />
+<text  x="201.91" y="303.5" ></text>
+</g>
+<g >
+<title>schedule (217 samples, 50.35%)</title><rect x="565.8" y="245" width="594.1" height="15.0" fill="rgb(230,229,2)" rx="2" ry="2" />
+<text  x="568.78" y="255.5" >schedule</text>
+</g>
+<g >
+<title>std::__invoke_impl&lt;void, drive::common::ipc::LocalShmBus::init (15 samples, 3.48%)</title><rect x="12.7" y="277" width="41.1" height="15.0" fill="rgb(228,44,48)" rx="2" ry="2" />
+<text  x="15.74" y="287.5" >std..</text>
+</g>
+<g >
+<title>group_sched_in (1 samples, 0.23%)</title><rect x="108.6" y="101" width="2.7" height="15.0" fill="rgb(235,215,29)" rx="2" ry="2" />
+<text  x="111.56" y="111.5" ></text>
+</g>
+<g >
+<title>std::chrono::duration&lt;long, std::ratio&lt;1l, 1l&gt; &gt;::duration&lt;long, void&gt; (1 samples, 0.23%)</title><rect x="78.4" y="149" width="2.8" height="15.0" fill="rgb(245,1,30)" rx="2" ry="2" />
+<text  x="81.45" y="159.5" ></text>
+</g>
+<g >
+<title>plusai::common::base::CpuTicksTimePoint&lt;long&gt;::CpuTicksTimePoint (1 samples, 0.23%)</title><rect x="73.0" y="213" width="2.7" height="15.0" fill="rgb(232,183,15)" rx="2" ry="2" />
+<text  x="75.97" y="223.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (1 samples, 0.23%)</title><rect x="319.4" y="309" width="2.7" height="15.0" fill="rgb(245,207,17)" rx="2" ry="2" />
+<text  x="322.37" y="319.5" ></text>
+</g>
+<g >
+<title>update_curr (1 samples, 0.23%)</title><rect x="576.7" y="165" width="2.8" height="15.0" fill="rgb(207,152,6)" rx="2" ry="2" />
+<text  x="579.73" y="175.5" ></text>
+</g>
+<g >
+<title>std::chrono::_V2::system_clock::now@plt (1 samples, 0.23%)</title><rect x="67.5" y="197" width="2.7" height="15.0" fill="rgb(233,41,26)" rx="2" ry="2" />
+<text  x="70.49" y="207.5" ></text>
+</g>
+<g >
+<title>perf_event_sched_in (1 samples, 0.23%)</title><rect x="108.6" y="165" width="2.7" height="15.0" fill="rgb(253,166,36)" rx="2" ry="2" />
+<text  x="111.56" y="175.5" ></text>
+</g>
+<g >
+<title>task_ctx_sched_out (1 samples, 0.23%)</title><rect x="571.3" y="197" width="2.7" height="15.0" fill="rgb(248,54,41)" rx="2" ry="2" />
+<text  x="574.25" y="207.5" ></text>
+</g>
+<g >
+<title>futex_wait (219 samples, 50.81%)</title><rect x="565.8" y="277" width="599.6" height="15.0" fill="rgb(243,167,50)" rx="2" ry="2" />
+<text  x="568.78" y="287.5" >futex_wait</text>
+</g>
+<g >
+<title>__x64_sys_futex (222 samples, 51.51%)</title><rect x="560.3" y="309" width="607.8" height="15.0" fill="rgb(250,167,27)" rx="2" ry="2" />
+<text  x="563.30" y="319.5" >__x64_sys_futex</text>
+</g>
+<g >
+<title>pick_next_task_fair (1 samples, 0.23%)</title><rect x="1157.1" y="213" width="2.8" height="15.0" fill="rgb(215,103,17)" rx="2" ry="2" />
+<text  x="1160.15" y="223.5" ></text>
+</g>
+<g >
+<title>__sched_text_start (34 samples, 7.89%)</title><rect x="105.8" y="213" width="93.1" height="15.0" fill="rgb(249,141,30)" rx="2" ry="2" />
+<text  x="108.82" y="223.5" >__sched_tex..</text>
+</g>
+<g >
+<title>std::_Head_base&lt;0ul, LockFreeAppendOnlyHashMap&lt;drive::common::metrics::LogTimer, 65536ul&gt;::Entry*, false&gt;::_M_head (1 samples, 0.23%)</title><rect x="62.0" y="133" width="2.8" height="15.0" fill="rgb(229,98,36)" rx="2" ry="2" />
+<text  x="65.02" y="143.5" ></text>
+</g>
+<g >
+<title>cpuacct_charge (1 samples, 0.23%)</title><rect x="576.7" y="149" width="2.8" height="15.0" fill="rgb(245,13,15)" rx="2" ry="2" />
+<text  x="579.73" y="159.5" ></text>
+</g>
+<g >
+<title>intel_tfa_pmu_enable_all (32 samples, 7.42%)</title><rect x="111.3" y="133" width="87.6" height="15.0" fill="rgb(250,120,45)" rx="2" ry="2" />
+<text  x="114.30" y="143.5" >intel_tfa_..</text>
+</g>
+<g >
+<title>hrtimer_start_range_ns (1 samples, 0.23%)</title><rect x="209.9" y="245" width="2.7" height="15.0" fill="rgb(210,45,19)" rx="2" ry="2" />
+<text  x="212.86" y="255.5" ></text>
+</g>
+<g >
+<title>intel_tfa_pmu_enable_all (196 samples, 45.48%)</title><rect x="609.6" y="149" width="536.6" height="15.0" fill="rgb(217,79,0)" rx="2" ry="2" />
+<text  x="612.58" y="159.5" >intel_tfa_pmu_enable_all</text>
+</g>
+<g >
+<title>drive::common::metrics::Registry::scoped_function_timer_log (2 samples, 0.46%)</title><rect x="70.2" y="245" width="5.5" height="15.0" fill="rgb(232,200,2)" rx="2" ry="2" />
+<text  x="73.23" y="255.5" ></text>
+</g>
+<g >
+<title>flexible_sched_in (1 samples, 0.23%)</title><rect x="108.6" y="117" width="2.7" height="15.0" fill="rgb(227,129,40)" rx="2" ry="2" />
+<text  x="111.56" y="127.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (38 samples, 8.82%)</title><rect x="207.1" y="325" width="104.1" height="15.0" fill="rgb(224,194,25)" rx="2" ry="2" />
+<text  x="210.12" y="335.5" >entry_SYSCAL..</text>
+</g>
+<g >
+<title>try_to_wake_up (1 samples, 0.23%)</title><rect x="103.1" y="165" width="2.7" height="15.0" fill="rgb(228,99,21)" rx="2" ry="2" />
+<text  x="106.09" y="175.5" ></text>
+</g>
+<g >
+<title>drive::common::ipc::GlobalShmBus::Get (1 samples, 0.23%)</title><rect x="26.4" y="229" width="2.8" height="15.0" fill="rgb(224,26,7)" rx="2" ry="2" />
+<text  x="29.43" y="239.5" ></text>
+</g>
+<g >
+<title>futex_wait_setup (1 samples, 0.23%)</title><rect x="1159.9" y="261" width="2.7" height="15.0" fill="rgb(236,204,20)" rx="2" ry="2" />
+<text  x="1162.88" y="271.5" ></text>
+</g>
+<g >
+<title>drive::common::metrics::LatencyAggregatorReporter::send (2 samples, 0.46%)</title><rect x="21.0" y="181" width="5.4" height="15.0" fill="rgb(231,35,46)" rx="2" ry="2" />
+<text  x="23.95" y="191.5" ></text>
+</g>
+<g >
+<title>sock_poll (1 samples, 0.23%)</title><rect x="502.8" y="277" width="2.7" height="15.0" fill="rgb(216,186,30)" rx="2" ry="2" />
+<text  x="505.81" y="287.5" ></text>
+</g>
+<g >
+<title>wq_sleep.constprop.0 (34 samples, 7.89%)</title><rect x="105.8" y="261" width="93.1" height="15.0" fill="rgb(211,128,7)" rx="2" ry="2" />
+<text  x="108.82" y="271.5" >wq_sleep.co..</text>
+</g>
+<g >
+<title>std::atomic&lt;drive::common::base::HighResTimerState&gt;::compare_exchange_strong (1 samples, 0.23%)</title><rect x="18.2" y="165" width="2.8" height="15.0" fill="rgb(217,94,39)" rx="2" ry="2" />
+<text  x="21.21" y="175.5" ></text>
+</g>
+<g >
+<title>event_sched_in.isra.0 (2 samples, 0.46%)</title><rect x="598.6" y="101" width="5.5" height="15.0" fill="rgb(223,146,48)" rx="2" ry="2" />
+<text  x="601.63" y="111.5" ></text>
+</g>
+<g >
+<title>drive::common::metrics::ScopedTimer::stop (1 samples, 0.23%)</title><rect x="75.7" y="229" width="2.7" height="15.0" fill="rgb(250,208,34)" rx="2" ry="2" />
+<text  x="78.71" y="239.5" ></text>
+</g>
+<g >
+<title>drive::common::metrics::ScopedTimer::~ScopedTimer (1 samples, 0.23%)</title><rect x="75.7" y="245" width="2.7" height="15.0" fill="rgb(216,182,21)" rx="2" ry="2" />
+<text  x="78.71" y="255.5" ></text>
+</g>
+<g >
+<title>do_futex (2 samples, 0.46%)</title><rect x="313.9" y="277" width="5.5" height="15.0" fill="rgb(229,129,38)" rx="2" ry="2" />
+<text  x="316.90" y="287.5" ></text>
+</g>
+<g >
+<title>_nohz_idle_balance (1 samples, 0.23%)</title><rect x="1157.1" y="181" width="2.8" height="15.0" fill="rgb(220,51,49)" rx="2" ry="2" />
+<text  x="1160.15" y="191.5" ></text>
+</g>
+<g >
+<title>__x64_sys_nanosleep (36 samples, 8.35%)</title><rect x="209.9" y="293" width="98.5" height="15.0" fill="rgb(246,25,37)" rx="2" ry="2" />
+<text  x="212.86" y="303.5" >__x64_sys_n..</text>
+</g>
+<g >
+<title>enqueue_task_fair (1 samples, 0.23%)</title><rect x="103.1" y="117" width="2.7" height="15.0" fill="rgb(248,143,37)" rx="2" ry="2" />
+<text  x="106.09" y="127.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64 (1 samples, 0.23%)</title><rect x="530.2" y="341" width="2.7" height="15.0" fill="rgb(232,227,50)" rx="2" ry="2" />
+<text  x="533.19" y="351.5" ></text>
+</g>
+<g >
+<title>irq_work_interrupt (1 samples, 0.23%)</title><rect x="1151.7" y="197" width="2.7" height="15.0" fill="rgb(225,183,22)" rx="2" ry="2" />
+<text  x="1154.67" y="207.5" ></text>
+</g>
+<g >
+<title>ros::ok (1 samples, 0.23%)</title><rect x="204.4" y="245" width="2.7" height="15.0" fill="rgb(242,62,26)" rx="2" ry="2" />
+<text  x="207.39" y="255.5" ></text>
+</g>
+<g >
+<title>intel_tfa_pmu_enable_all (33 samples, 7.66%)</title><rect x="218.1" y="149" width="90.3" height="15.0" fill="rgb(235,89,44)" rx="2" ry="2" />
+<text  x="221.07" y="159.5" >intel_tfa_..</text>
+</g>
+<g >
+<title>perf_swevent_add (1 samples, 0.23%)</title><rect x="108.6" y="85" width="2.7" height="15.0" fill="rgb(237,24,38)" rx="2" ry="2" />
+<text  x="111.56" y="95.5" ></text>
+</g>
+<g >
+<title>apic_timer_interrupt (1 samples, 0.23%)</title><rect x="103.1" y="261" width="2.7" height="15.0" fill="rgb(239,66,0)" rx="2" ry="2" />
+<text  x="106.09" y="271.5" ></text>
+</g>
+<g >
+<title>__nanosleep (39 samples, 9.05%)</title><rect x="207.1" y="341" width="106.8" height="15.0" fill="rgb(239,163,1)" rx="2" ry="2" />
+<text  x="210.12" y="351.5" >__nanosleep</text>
+</g>
+<g >
+<title>boost::thread_specific_ptr&lt;ros::CallbackQueue::TLS&gt;::delete_data::~delete_data (3 samples, 0.70%)</title><rect x="324.8" y="341" width="8.3" height="15.0" fill="rgb(223,203,34)" rx="2" ry="2" />
+<text  x="327.85" y="351.5" ></text>
+</g>
+<g >
+<title>__update_idle_core (1 samples, 0.23%)</title><rect x="316.6" y="165" width="2.8" height="15.0" fill="rgb(216,63,27)" rx="2" ry="2" />
+<text  x="319.64" y="175.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (25 samples, 5.80%)</title><rect x="335.8" y="325" width="68.4" height="15.0" fill="rgb(251,83,35)" rx="2" ry="2" />
+<text  x="338.80" y="335.5" >entry_S..</text>
+</g>
+<g >
+<title>__cgroup_account_cputime_field (1 samples, 0.23%)</title><rect x="1148.9" y="37" width="2.8" height="15.0" fill="rgb(208,107,4)" rx="2" ry="2" />
+<text  x="1151.93" y="47.5" ></text>
+</g>
+<g >
+<title>std::__invoke&lt;void  (17 samples, 3.94%)</title><rect x="53.8" y="293" width="46.5" height="15.0" fill="rgb(220,147,18)" rx="2" ry="2" />
+<text  x="56.81" y="303.5" >std:..</text>
+</g>
+<g >
+<title>__pthread_mutex_unlock (1 samples, 0.23%)</title><rect x="412.5" y="325" width="2.7" height="15.0" fill="rgb(249,209,7)" rx="2" ry="2" />
+<text  x="415.46" y="335.5" ></text>
+</g>
+<g >
+<title>std::chrono::duration_cast&lt;std::chrono::duration&lt;long, std::ratio&lt;1l, 1l&gt; &gt;, long, std::ratio&lt;1l, 1000000000l&gt; &gt; (1 samples, 0.23%)</title><rect x="78.4" y="165" width="2.8" height="15.0" fill="rgb(209,81,8)" rx="2" ry="2" />
+<text  x="81.45" y="175.5" ></text>
+</g>
+<g >
+<title>__perf_event_task_sched_in (35 samples, 8.12%)</title><rect x="212.6" y="197" width="95.8" height="15.0" fill="rgb(233,146,21)" rx="2" ry="2" />
+<text  x="215.60" y="207.5" >__perf_even..</text>
+</g>
+<g >
+<title>visit_groups_merge (6 samples, 1.39%)</title><rect x="590.4" y="149" width="16.4" height="15.0" fill="rgb(219,36,30)" rx="2" ry="2" />
+<text  x="593.42" y="159.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (1 samples, 0.23%)</title><rect x="319.4" y="325" width="2.7" height="15.0" fill="rgb(250,68,23)" rx="2" ry="2" />
+<text  x="322.37" y="335.5" ></text>
+</g>
+<g >
+<title>ipc_benchmark (431 samples, 100.00%)</title><rect x="10.0" y="373" width="1180.0" height="15.0" fill="rgb(226,135,31)" rx="2" ry="2" />
+<text  x="13.00" y="383.5" >ipc_benchmark</text>
+</g>
+<g >
+<title>drive::common::ipc::PIDSpinlock::lock (1 samples, 0.23%)</title><rect x="53.8" y="245" width="2.7" height="15.0" fill="rgb(226,153,16)" rx="2" ry="2" />
+<text  x="56.81" y="255.5" ></text>
+</g>
+<g >
+<title>put_dec (1 samples, 0.23%)</title><rect x="409.7" y="133" width="2.8" height="15.0" fill="rgb(244,116,41)" rx="2" ry="2" />
+<text  x="412.72" y="143.5" ></text>
+</g>
+<g >
+<title>drive::common::metrics::Registry::scoped_function_timer_log (1 samples, 0.23%)</title><rect x="29.2" y="229" width="2.7" height="15.0" fill="rgb(231,103,27)" rx="2" ry="2" />
+<text  x="32.16" y="239.5" ></text>
+</g>
+<g >
+<title>event_sched_in.isra.0 (1 samples, 0.23%)</title><rect x="346.8" y="69" width="2.7" height="15.0" fill="rgb(248,186,37)" rx="2" ry="2" />
+<text  x="349.75" y="79.5" ></text>
+</g>
+<g >
+<title>update_blocked_averages (1 samples, 0.23%)</title><rect x="1157.1" y="149" width="2.8" height="15.0" fill="rgb(225,192,43)" rx="2" ry="2" />
+<text  x="1160.15" y="159.5" ></text>
+</g>
+<g >
+<title>std::condition_variable::__wait_until_impl&lt;std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000000l&gt; &gt; &gt; (1 samples, 0.23%)</title><rect x="78.4" y="197" width="2.8" height="15.0" fill="rgb(224,139,28)" rx="2" ry="2" />
+<text  x="81.45" y="207.5" ></text>
+</g>
+<g >
+<title>drive::common::ipc::LocalShmBus::init (15 samples, 3.48%)</title><rect x="12.7" y="261" width="41.1" height="15.0" fill="rgb(212,227,37)" rx="2" ry="2" />
+<text  x="15.74" y="271.5" >dri..</text>
+</g>
+<g >
+<title>deactivate_task (3 samples, 0.70%)</title><rect x="574.0" y="213" width="8.2" height="15.0" fill="rgb(225,138,46)" rx="2" ry="2" />
+<text  x="576.99" y="223.5" ></text>
+</g>
+<g >
+<title>_raw_spin_lock (1 samples, 0.23%)</title><rect x="563.0" y="277" width="2.8" height="15.0" fill="rgb(243,55,29)" rx="2" ry="2" />
+<text  x="566.04" y="287.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (33 samples, 7.66%)</title><rect x="417.9" y="341" width="90.4" height="15.0" fill="rgb(216,2,9)" rx="2" ry="2" />
+<text  x="420.94" y="351.5" >entry_SYSC..</text>
+</g>
+<g >
+<title>__x64_sys_poll (33 samples, 7.66%)</title><rect x="417.9" y="309" width="90.4" height="15.0" fill="rgb(254,221,28)" rx="2" ry="2" />
+<text  x="420.94" y="319.5" >__x64_sys_..</text>
+</g>
+<g >
+<title>drive::common::ipc::LocalShmBusDispatcherImpl::monitorThreadFunc (6 samples, 1.39%)</title><rect x="53.8" y="261" width="16.4" height="15.0" fill="rgb(229,101,31)" rx="2" ry="2" />
+<text  x="56.81" y="271.5" ></text>
+</g>
+<g >
+<title>schedule_hrtimeout_range_clock (29 samples, 6.73%)</title><rect x="423.4" y="245" width="79.4" height="15.0" fill="rgb(251,87,38)" rx="2" ry="2" />
+<text  x="426.41" y="255.5" >schedule_..</text>
+</g>
+<g >
+<title>ep_poll (23 samples, 5.34%)</title><rect x="341.3" y="261" width="62.9" height="15.0" fill="rgb(240,141,6)" rx="2" ry="2" />
+<text  x="344.28" y="271.5" >ep_poll</text>
+</g>
+<g >
+<title>copy_user_generic_unrolled (1 samples, 0.23%)</title><rect x="1165.4" y="277" width="2.7" height="15.0" fill="rgb(254,2,35)" rx="2" ry="2" />
+<text  x="1168.36" y="287.5" ></text>
+</g>
+<g >
+<title>drive::common::ipc::LocalShmBus::processOwnBusListener (5 samples, 1.16%)</title><rect x="12.7" y="245" width="13.7" height="15.0" fill="rgb(232,137,31)" rx="2" ry="2" />
+<text  x="15.74" y="255.5" ></text>
+</g>
+<g >
+<title>std::unique_ptr&lt;drive::common::ipc::GlobalShmBusImpl, std::default_delete&lt;drive::common::ipc::GlobalShmBusImpl&gt; &gt;::operator* (1 samples, 0.23%)</title><rect x="37.4" y="229" width="2.7" height="15.0" fill="rgb(222,211,21)" rx="2" ry="2" />
+<text  x="40.38" y="239.5" ></text>
+</g>
+<g >
+<title>plusai::common::logging::AsyncLogPrinter::flush (1 samples, 0.23%)</title><rect x="89.4" y="245" width="2.7" height="15.0" fill="rgb(217,120,19)" rx="2" ry="2" />
+<text  x="92.40" y="255.5" ></text>
+</g>
+<g >
+<title>perf_pmu_enable.part.0 (196 samples, 45.48%)</title><rect x="609.6" y="181" width="536.6" height="15.0" fill="rgb(246,121,50)" rx="2" ry="2" />
+<text  x="612.58" y="191.5" >perf_pmu_enable.part.0</text>
+</g>
+<g >
+<title>__sched_text_start (1 samples, 0.23%)</title><rect x="319.4" y="213" width="2.7" height="15.0" fill="rgb(246,124,8)" rx="2" ry="2" />
+<text  x="322.37" y="223.5" ></text>
+</g>
+<g >
+<title>__fdget (1 samples, 0.23%)</title><rect x="100.3" y="277" width="2.8" height="15.0" fill="rgb(220,179,37)" rx="2" ry="2" />
+<text  x="103.35" y="287.5" ></text>
+</g>
+<g >
+<title>boost::detail::get_tss_data (3 samples, 0.70%)</title><rect x="324.8" y="293" width="8.3" height="15.0" fill="rgb(234,195,22)" rx="2" ry="2" />
+<text  x="327.85" y="303.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (36 samples, 8.35%)</title><rect x="100.3" y="309" width="98.6" height="15.0" fill="rgb(240,129,44)" rx="2" ry="2" />
+<text  x="103.35" y="319.5" >do_syscall_64</text>
+</g>
+<g >
+<title>drive::common::metrics::LogTimer::update (1 samples, 0.23%)</title><rect x="64.8" y="213" width="2.7" height="15.0" fill="rgb(245,132,51)" rx="2" ry="2" />
+<text  x="67.76" y="223.5" ></text>
+</g>
+<g >
+<title>ctx_sched_in (1 samples, 0.23%)</title><rect x="212.6" y="165" width="2.7" height="15.0" fill="rgb(215,160,33)" rx="2" ry="2" />
+<text  x="215.60" y="175.5" ></text>
+</g>
+<g >
+<title>boost::detail::function::function_obj_invoker3&lt;drive::common::ipc::detail::advertise (1 samples, 0.23%)</title><rect x="10.0" y="165" width="2.7" height="15.0" fill="rgb(242,93,40)" rx="2" ry="2" />
+<text  x="13.00" y="175.5" ></text>
+</g>
+<g >
+<title>drive::common::ipc::detail::PublisherImpl::publish (1 samples, 0.23%)</title><rect x="10.0" y="229" width="2.7" height="15.0" fill="rgb(238,25,1)" rx="2" ry="2" />
+<text  x="13.00" y="239.5" ></text>
+</g>
+<g >
+<title>std::atomic&lt;boost::lockfree::detail::tagged_ptr&lt;boost::lockfree::queue&lt;plusai::common::logging::AsyncLogPrinter::WorkItem*&gt;::node&gt; &gt;::load (1 samples, 0.23%)</title><rect x="89.4" y="181" width="2.7" height="15.0" fill="rgb(207,0,34)" rx="2" ry="2" />
+<text  x="92.40" y="191.5" ></text>
+</g>
+<g >
+<title>flexible_sched_in (1 samples, 0.23%)</title><rect x="346.8" y="101" width="2.7" height="15.0" fill="rgb(217,41,2)" rx="2" ry="2" />
+<text  x="349.75" y="111.5" ></text>
+</g>
+<g >
+<title>_pthread_cleanup_pop (1 samples, 0.23%)</title><rect x="508.3" y="357" width="2.7" height="15.0" fill="rgb(228,102,34)" rx="2" ry="2" />
+<text  x="511.28" y="367.5" ></text>
+</g>
+<g >
+<title>schedule (22 samples, 5.10%)</title><rect x="344.0" y="213" width="60.2" height="15.0" fill="rgb(224,131,43)" rx="2" ry="2" />
+<text  x="347.01" y="223.5" >schedule</text>
+</g>
+<g >
+<title>drive::common::metrics::LatencyAggregatorReporter::send (1 samples, 0.23%)</title><rect x="64.8" y="197" width="2.7" height="15.0" fill="rgb(217,62,14)" rx="2" ry="2" />
+<text  x="67.76" y="207.5" ></text>
+</g>
+<g >
+<title>ttwu_do_activate (1 samples, 0.23%)</title><rect x="103.1" y="149" width="2.7" height="15.0" fill="rgb(247,178,29)" rx="2" ry="2" />
+<text  x="106.09" y="159.5" ></text>
+</g>
+<g >
+<title>x86_pmu_enable (32 samples, 7.42%)</title><rect x="111.3" y="149" width="87.6" height="15.0" fill="rgb(220,209,25)" rx="2" ry="2" />
+<text  x="114.30" y="159.5" >x86_pmu_en..</text>
+</g>
+<g >
+<title>tick_sched_timer (1 samples, 0.23%)</title><rect x="1148.9" y="133" width="2.8" height="15.0" fill="rgb(205,26,24)" rx="2" ry="2" />
+<text  x="1151.93" y="143.5" ></text>
+</g>
+<g >
+<title>std::__uniq_ptr_impl&lt;LockFreeAppendOnlyHashMap&lt;drive::common::metrics::LogTimer, 65536ul&gt;::Entry, std::default_delete&lt;LockFreeAppendOnlyHashMap&lt;drive::common::metrics::LogTimer, 65536ul&gt;::Entry&gt; &gt;::_M_ptr (1 samples, 0.23%)</title><rect x="62.0" y="181" width="2.8" height="15.0" fill="rgb(215,187,28)" rx="2" ry="2" />
+<text  x="65.02" y="191.5" ></text>
+</g>
+<g >
+<title>x86_pmu_enable (24 samples, 5.57%)</title><rect x="437.1" y="149" width="65.7" height="15.0" fill="rgb(205,150,37)" rx="2" ry="2" />
+<text  x="440.10" y="159.5" >x86_pmu..</text>
+</g>
+<g >
+<title>hrtimer_interrupt (2 samples, 0.46%)</title><rect x="1146.2" y="165" width="5.5" height="15.0" fill="rgb(206,213,50)" rx="2" ry="2" />
+<text  x="1149.19" y="175.5" ></text>
+</g>
+<g >
+<title>register_tm_clones (1 samples, 0.23%)</title><rect x="412.5" y="341" width="2.7" height="15.0" fill="rgb(242,173,42)" rx="2" ry="2" />
+<text  x="415.46" y="351.5" ></text>
+</g>
+<g >
+<title>deactivate_task (1 samples, 0.23%)</title><rect x="319.4" y="197" width="2.7" height="15.0" fill="rgb(224,219,6)" rx="2" ry="2" />
+<text  x="322.37" y="207.5" ></text>
+</g>
+<g >
+<title>drive::common::ipc::PubSubSpinner::spin (2 samples, 0.46%)</title><rect x="198.9" y="245" width="5.5" height="15.0" fill="rgb(213,15,30)" rx="2" ry="2" />
+<text  x="201.91" y="255.5" ></text>
+</g>
+<g >
+<title>ctx_sched_in (1 samples, 0.23%)</title><rect x="313.9" y="149" width="2.7" height="15.0" fill="rgb(254,89,11)" rx="2" ry="2" />
+<text  x="316.90" y="159.5" ></text>
+</g>
+<g >
+<title>std::map&lt;unsigned int, std::pair&lt;std::chrono::time_point&lt;std::chrono::_V2::system_clock, std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000000l&gt; &gt; &gt;, bool&gt;, std::less&lt;unsigned int&gt;, std::allocator&lt;std::pair&lt;unsigned int const, std::pair&lt;std::chrono::time_point&lt;std::chrono::_V2::system_clock, std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000000l&gt; &gt; &gt;, bool&gt; &gt; &gt; &gt;::lower_bound (1 samples, 0.23%)</title><rect x="59.3" y="229" width="2.7" height="15.0" fill="rgb(244,184,36)" rx="2" ry="2" />
+<text  x="62.28" y="239.5" ></text>
+</g>
+<g >
+<title>std::map&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt;, std::less&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; const, std::vector&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats, std::allocator&lt;drive::common::metrics::LatencyAggregatorReporter::BucketStats&gt; &gt; &gt; &gt; &gt;::lower_bound (2 samples, 0.46%)</title><rect x="21.0" y="165" width="5.4" height="15.0" fill="rgb(251,158,19)" rx="2" ry="2" />
+<text  x="23.95" y="175.5" ></text>
+</g>
+<g >
+<title>finish_task_switch (27 samples, 6.26%)</title><rect x="428.9" y="197" width="73.9" height="15.0" fill="rgb(217,14,24)" rx="2" ry="2" />
+<text  x="431.89" y="207.5" >finish_t..</text>
+</g>
+<g >
+<title>schedule (29 samples, 6.73%)</title><rect x="423.4" y="229" width="79.4" height="15.0" fill="rgb(214,71,40)" rx="2" ry="2" />
+<text  x="426.41" y="239.5" >schedule</text>
+</g>
+<g >
+<title>std::__get_helper&lt;0ul, LockFreeAppendOnlyHashMap&lt;drive::common::metrics::LogTimer, 65536ul&gt;::Entry*, std::default_delete&lt;LockFreeAppendOnlyHashMap&lt;drive::common::metrics::LogTimer, 65536ul&gt;::Entry&gt; &gt; (1 samples, 0.23%)</title><rect x="62.0" y="149" width="2.8" height="15.0" fill="rgb(253,123,15)" rx="2" ry="2" />
+<text  x="65.02" y="159.5" ></text>
+</g>
+<g >
+<title>all (431 samples, 100%)</title><rect x="10.0" y="389" width="1180.0" height="15.0" fill="rgb(253,108,35)" rx="2" ry="2" />
+<text  x="13.00" y="399.5" ></text>
+</g>
+<g >
+<title>std::condition_variable::wait_until&lt;std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000000l&gt; &gt; &gt; (1 samples, 0.23%)</title><rect x="51.1" y="213" width="2.7" height="15.0" fill="rgb(207,72,51)" rx="2" ry="2" />
+<text  x="54.07" y="223.5" ></text>
+</g>
+<g >
+<title>plusai::common::logging::AsyncLogPrinter::processPublishQueue (1 samples, 0.23%)</title><rect x="92.1" y="245" width="2.8" height="15.0" fill="rgb(246,12,12)" rx="2" ry="2" />
+<text  x="95.13" y="255.5" ></text>
+</g>
+<g >
+<title>sched_clock_cpu (1 samples, 0.23%)</title><rect x="571.3" y="165" width="2.7" height="15.0" fill="rgb(252,18,12)" rx="2" ry="2" />
+<text  x="574.25" y="175.5" ></text>
+</g>
+<g >
+<title>drive::common::metrics::ScopedTimer::stop (3 samples, 0.70%)</title><rect x="18.2" y="213" width="8.2" height="15.0" fill="rgb(219,44,15)" rx="2" ry="2" />
+<text  x="21.21" y="223.5" ></text>
+</g>
+<g >
+<title>drive::common::ipc::detail::PublisherImpl::publish (1 samples, 0.23%)</title><rect x="10.0" y="197" width="2.7" height="15.0" fill="rgb(225,204,10)" rx="2" ry="2" />
+<text  x="13.00" y="207.5" ></text>
+</g>
+<g >
+<title>std::thread::_Invoker&lt;std::tuple&lt;IpcBenchmarkProgram::go (1 samples, 0.23%)</title><rect x="10.0" y="309" width="2.7" height="15.0" fill="rgb(205,213,24)" rx="2" ry="2" />
+<text  x="13.00" y="319.5" ></text>
+</g>
+<g >
+<title>__tls_get_addr (1 samples, 0.23%)</title><rect x="70.2" y="229" width="2.8" height="15.0" fill="rgb(245,21,25)" rx="2" ry="2" />
+<text  x="73.23" y="239.5" ></text>
+</g>
+<g >
+<title>native_write_msr (33 samples, 7.66%)</title><rect x="218.1" y="133" width="90.3" height="15.0" fill="rgb(237,160,40)" rx="2" ry="2" />
+<text  x="221.07" y="143.5" >native_wri..</text>
+</g>
+<g >
+<title>std::condition_variable::wait_until&lt;std::chrono::_V2::system_clock, std::chrono::duration&lt;long, std::ratio&lt;1l, 1000000000l&gt; &gt;, drive::common::ipc::PubSubSpinner::shmBusPollThreadFunc (1 samples, 0.23%)</title><rect x="78.4" y="229" width="2.8" height="15.0" fill="rgb(221,182,0)" rx="2" ry="2" />
+<text  x="81.45" y="239.5" ></text>
+</g>
+<g >
+<title>main (3 samples, 0.70%)</title><rect x="198.9" y="325" width="8.2" height="15.0" fill="rgb(233,58,25)" rx="2" ry="2" />
+<text  x="201.91" y="335.5" ></text>
+</g>
+<g >
+<title>__x64_sys_epoll_wait (23 samples, 5.34%)</title><rect x="341.3" y="293" width="62.9" height="15.0" fill="rgb(212,31,50)" rx="2" ry="2" />
+<text  x="344.28" y="303.5" >__x64_..</text>
+</g>
+<g >
+<title>do_futex (1 samples, 0.23%)</title><rect x="319.4" y="277" width="2.7" height="15.0" fill="rgb(226,192,35)" rx="2" ry="2" />
+<text  x="322.37" y="287.5" ></text>
+</g>
+<g >
+<title>std::thread::_Invoker&lt;std::tuple&lt;IpcBenchmarkProgram::go (1 samples, 0.23%)</title><rect x="10.0" y="325" width="2.7" height="15.0" fill="rgb(237,142,19)" rx="2" ry="2" />
+<text  x="13.00" y="335.5" ></text>
+</g>
+<g >
+<title>__update_load_avg_cfs_rq (1 samples, 0.23%)</title><rect x="319.4" y="133" width="2.7" height="15.0" fill="rgb(219,160,0)" rx="2" ry="2" />
+<text  x="322.37" y="143.5" ></text>
+</g>
+</g>
+</svg>
